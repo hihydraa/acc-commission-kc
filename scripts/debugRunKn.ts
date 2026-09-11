@@ -46,8 +46,8 @@ async function main() {
   console.log("\n=== EXPECTED (spec §8, เดือน 8/2569) ===");
   console.log("qualifying rows: A7=25 B7=31 68=4 B3=13");
   console.log("B3 total commission: 1079.1075");
-  console.log("อ้อม=4499.1075(→4499.11) ต้อม=720.00 วีระ=240.00");
-  console.log("debt matches: IDB726080022(20600) IDB726080043(107700) IDB726080044(107550)");
+  console.log("อ้อม=4499.1075(→4499.11) ต้อม=720.00 วีระ=240.00 gross (before debt)");
+  console.log("debt matches: IDB726080022(20600) IDB726080043(107700) IDB726080044(107550) — auto-deducted (ยืนยันจากผู้ใช้ 11 ก.ย.69, หักเหมือนสามทอง)");
   console.log("blocked rows among qualifying: should be 0 once master data is complete");
 
   console.log(`\n${result.warnings.length} warnings:`);
