@@ -125,7 +125,15 @@ export function parseDistanceMasterText(text: string, salespersonRoster: string[
     const beforeSalesperson = segment.slice(0, sm.index!);
     const distanceTokens = [...beforeSalesperson.matchAll(DISTANCE_TOKEN_RE)];
     const lastDistanceToken = distanceTokens.length > 0 ? distanceTokens[distanceTokens.length - 1][1] : null;
-    if (!lastDistanceToken) {
+    // "ทางผ่าน" (route pass-through, ค่าขนส่ง = 0) is sometimes printed as
+    // literal text in the distance column instead of a number or "-" — a
+    // valid, expected value (confirmed against a real row: "...KCL660037
+    // อ.กระนวนทางผ่านอ้อม"), not a parsing failure, so it must not raise the
+    // same warning as a genuinely missing/unparseable column. Matched
+    // loosely (ทาง + ผ within a few characters) to tolerate this same PDF's
+    // own า→ำ vowel-corruption risk noted above.
+    const looksLikePassThrough = /ทาง.{0,2}ผ.{0,2}น/.test(beforeSalesperson);
+    if (!lastDistanceToken && !looksLikePassThrough) {
       warnings.push(`ลูกค้า ${customerCode}: ไม่พบคอลัมน์ระยะทาง — ตรวจสอบไฟล์ master ต้นฉบับ`);
     }
     const distanceKm = lastDistanceToken === null || lastDistanceToken === "-" ? null : parseFloat(lastDistanceToken);
