@@ -1,36 +1,98 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ระบบคำนวณค่าคอมมิชชั่นฝ่ายการตลาด
 
-## Getting Started
+เว็บแอประบบคำนวณค่าคอมมิชชั่นรายเดือนของเจ้าหน้าที่การตลาด (เซลล์) จากไฟล์ PDF ที่ระบบขายส่งออกมา
+(รายงานขายรายคันรถ + รายงานลูกหนี้ค้างชำระ + ไฟล์ master ระยะทาง/เซลล์) แล้วสร้างไฟล์ Excel ผลลัพธ์
+ที่มีสูตรจริงทุกคอลัมน์ (ตรวจสอบ/แก้ไขต่อได้ใน Excel) — ตามกระบวนการที่สรุปไว้ใน skill
+`marketing-commission-calc`
 
-First, run the development server:
+**ไม่มีฐานข้อมูล** — แต่ละคำขอ (request) ประมวลผลไฟล์ที่อัปโหลดมาในหน่วยความจำแล้วส่งไฟล์ Excel กลับทันที
+ไม่มีการเก็บข้อมูลไว้ที่ฝั่งเซิร์ฟเวอร์ เหมาะสำหรับรันบน Vercel (serverless)
+
+## รองรับหลายสาขา
+
+กระบวนการคำนวณ (`src/lib/pipeline.ts`, `src/lib/calc/commissionEngine.ts`, `src/lib/excelExport.ts`)
+เป็นกลาง ไม่ผูกกับสาขาใดสาขาหนึ่ง — ตัวเลขเฉพาะของแต่ละสาขา (ชนิดสินค้าที่นับ, เกณฑ์ปริมาณ, อัตรา/เกณฑ์
+ค่าคอม, รายชื่อเซลล์, สัดส่วนแบ่งทีม, ข้อมูล master ที่ยืนยันไว้ล่วงหน้า) อยู่แยกเป็น config ต่อสาขาใน
+`src/branches/*.ts`
+
+ปัจจุบันมีสาขาเดียวที่ตั้งค่าไว้: **สามทอง/โลจิสติกส์** (`src/branches/samthong.ts`) — สร้างจากตัวอย่าง
+อ้างอิง ST_8.69 (ส.ค. 2569) ที่อนุมัติแล้วตาม skill
+
+### เพิ่มสาขาใหม่
+
+1. สร้างไฟล์ใหม่ใน `src/branches/<ชื่อสาขา>.ts` implement `BranchConfig` (ดู `src/branches/types.ts`)
+   — **ห้ามคัดลอกตัวเลขของสามทองไปใช้** ต้องขอตารางสัดส่วนแบ่งทีม รายชื่อเซลล์ และไฟล์ master ของสาขานั้น
+   จากผู้ใช้ก่อนเสมอ (ตามหลักการของ skill)
+2. เพิ่มเข้า `BRANCHES` array ใน `src/branches/samthong.ts` (หรือย้าย registry ไปไฟล์กลางถ้ามีหลายสาขา)
+3. หน้าเว็บ (`src/app/page.tsx`) จะแสดงสาขาใหม่ในตัวเลือกอัตโนมัติ
+
+## การรันในเครื่อง
 
 ```bash
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+เปิด http://localhost:3000 แล้วเลือกสาขา + อัปโหลดไฟล์ PDF (รายงานขายหลายไฟล์, รายงานลูกหนี้ 1 ไฟล์,
+ไฟล์ master ถ้ามี) กด "คำนวณค่าคอม" ระบบจะแสดงสรุปตัวเลขและปุ่มดาวน์โหลดไฟล์ Excel
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### ทดสอบเทียบกับข้อมูลจริง (regression test)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+`scripts/debugRun.ts` เรียก pipeline ตรงๆ (ไม่ผ่าน HTTP) แล้ว dump ยอดต่อคันรถ/รายการที่เข้าเกณฑ์ —
+ใช้ไฟล์จริงของเดือน ส.ค. 2569 สาขาสามทอง (ไม่ได้ commit เข้า repo เพราะเป็นข้อมูลลูกค้าจริง) แก้ path
+`dir` ในสคริปต์ให้ชี้ไปที่โฟลเดอร์ไฟล์จริงแล้วรัน:
 
-## Learn More
+```bash
+npx tsx scripts/debugRun.ts
+```
 
-To learn more about Next.js, take a look at the following resources:
+ผลลัพธ์ที่ควรได้ตรงกับตัวอย่างอ้างอิงใน SKILL.md ("Reference example: ST_8.69"):
+รายการเข้าเกณฑ์ 55 รายการ จาก 22 ลูกค้า รวม 154,000 ลิตร, ค่าคอมมิชชั่นรวม (ก่อนหักหนี้) ฿4,500,
+หักหนี้ค้างชำระ ฿180, ค่าคอมสุทธิ ฿4,320, ยอดต่อคัน: รถ 55 ฿990 / รถ 65 ฿660 / รถ 69 ฿480 /
+รถ 71 ฿1,770 / เทรลเลอร์ 73 ฿360 / เทรลเลอร์ 74 ฿240 — **สคริปต์นี้ยืนยันตัวเลขตรงกันครบทุกจุดแล้ว**
+ระหว่างพัฒนา ควรรันซ้ำทุกครั้งที่แก้ parser/สูตรคำนวณ
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Deploy บน Vercel
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```bash
+npm install -g vercel   # ถ้ายังไม่มี
+vercel
+```
 
-## Deploy on Vercel
+ไม่ต้องตั้งค่า environment variable หรือฐานข้อมูลใดๆ — โปรเจกต์นี้ stateless ล้วนๆ API route
+(`src/app/api/calculate/route.ts`) ตั้ง `runtime = "nodejs"` ไว้แล้ว (จำเป็นสำหรับ `pdf-parse`/`exceljs`
+ซึ่งใช้ Node API ที่ Edge runtime ไม่รองรับ)
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+ไฟล์ PDF ที่ใหญ่/หลายไฟล์รวมกันอาจใช้เวลาประมวลผลเกิน timeout เริ่มต้นของแผนฟรี (10 วินาที) — ปรับ
+`maxDuration` ใน `route.ts` หรืออัปเกรดแผนตามความจำเป็น
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## โครงสร้างโค้ด
+
+```
+src/
+  lib/
+    parser/          PDF text -> structured data (รายงานขาย, รายงานลูกหนี้, master ระยะทาง/เซลล์)
+    calc/             สูตรคำนวณ (freight table, commission engine, team split, rounding)
+    excelExport.ts    สร้างไฟล์ .xlsx ด้วยสูตรจริง (VLOOKUP/IFS/IFERROR) ตรงกับ Template
+    pipeline.ts       ประกอบทุกขั้นตอนเข้าด้วยกัน (parse -> calc -> debt match -> workbook)
+  branches/           config เฉพาะสาขา (ตัวเลข/เกณฑ์/roster ต่างกันได้ต่อสาขา)
+  app/
+    page.tsx          หน้าอัปโหลด + แสดงผลสรุป
+    api/calculate/    API route (multipart upload -> xlsx เป็น base64 ใน JSON response)
+```
+
+### สิ่งที่ระบบ "ไม่" ทำอัตโนมัติ (ต้องทำเองนอกระบบ)
+
+ตามประกาศ Incentive ข้อ 6-7: ลูกหนี้ค้างชำระเกิน Credit Term ที่ยังไม่จ่าย ให้ตัดค่าคอมเหลือ 50%
+(เต็ม 100% ถ้าตกลงผ่อนตามตาราง) — เป็น manual adjustment ที่ฝ่ายบัญชีต้องปรับเองหลังได้ไฟล์จากระบบนี้
+(ดูรายละเอียดใน `marketing-commission-calc/references/incentive-policy-mapping.md`)
+
+### จุดที่ต้องตรวจสอบก่อนส่งมอบไฟล์ทุกครั้ง
+
+ไฟล์ Excel ที่ได้มีสูตรจริงทุกคอลัมน์ ไม่ใช่ค่าที่คำนวณมาแปะ — **เปิดไฟล์ด้วย Excel/LibreOffice แล้วปล่อยให้
+คำนวณสูตรใหม่ทั้งไฟล์ (คลิก Enable Editing / กด Ctrl+Alt+F9 ถ้าตัวเลขดูนิ่ง) แล้วเทียบยอดในชีท "ค่าคอมรวม"
+กับผลรวม "รวมทั้งชีท" ของทุกชีทคันรถ** ก่อนส่งมอบ — ถ้าไม่ตรงกันคือบั๊ก ต้องตามหา ไม่ใช่ปัดเศษ
+ระบบเองพยายามบังคับให้คำนวณใหม่ตอนเปิดไฟล์แล้ว (`fullCalcOnLoad`) แต่บาง viewer ก็ยังต้องกดคำนวณเอง
+
+ดูชีท "หมายเหตุ" ในไฟล์ที่ได้ทุกครั้ง — มีคำเตือนเรื่องลูกค้าที่ไม่พบใน master, รายการที่มีข้อความ
+"มิเตอร์ NN" ต้องยืนยัน, และรายการที่ตรวจสอบประเภท(R) ไม่ได้ ซึ่งทั้งหมดนี้ระบบไม่กล้าตัดสินใจเอง

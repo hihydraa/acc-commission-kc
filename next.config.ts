@@ -1,7 +1,23 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // pdf-parse/pdfjs-dist do their own Node-side file/module resolution
+  // (worker files, optional native deps) that webpack's bundler mishandles —
+  // run them as plain CommonJS requires in the serverless function instead.
+  serverExternalPackages: ["pdf-parse", "pdfjs-dist"],
+  // pdfjs-dist (the pdf-parse fallback in pdfExtract.ts) dynamically imports
+  // its worker file at a path it computes relative to its own module
+  // location. Next's file tracing can't see that dynamic import statically,
+  // so on Vercel the worker file gets left out of the deployed function
+  // bundle entirely and the fallback fails at runtime with "Cannot find
+  // module .../pdf.worker.mjs" — even though it works fine locally (full
+  // node_modules present). This forces the worker file to ship with the
+  // function. Confirmed against a real Vercel deploy: without this, any PDF
+  // that trips pdf-parse's primary path (e.g. "bad XRef entry" on a
+  // malformed-but-common PDF structure) has nowhere to fall back to.
+  outputFileTracingIncludes: {
+    "/api/**/*": ["./node_modules/pdfjs-dist/legacy/build/*.mjs"],
+  },
 };
 
 export default nextConfig;
