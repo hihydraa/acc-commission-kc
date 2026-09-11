@@ -4,7 +4,7 @@ import { parseArReportText } from "./parser/arReport";
 import { parseDistanceMasterText } from "./parser/distanceMaster";
 import { calculateTransaction, type SaleType, type TransactionCalcResult } from "./calc/commissionEngine";
 import type { BranchConfig } from "@/branches/types";
-import { buildCommissionWorkbook, type ExportTransactionRow } from "./excelExport";
+import { buildCommissionWorkbook, type ExportTransactionRow, type MasterSheetRow } from "./excelExport";
 
 export interface InputFile {
   filename: string;
@@ -28,38 +28,83 @@ export interface PipelineResult {
   };
 }
 
-function truckLabelFromFilename(filename: string): string {
-  // Real filenames look like "เบอร์ 55_ST_8.69.pdf" / "เทรลเลอร์เบอร์ 73_ST_8.69.pdf" —
-  // keep everything up to the first "_" as the human label, fall back to the
-  // full stem if there's no underscore.
+/**
+ * "เบอร์ 55_ST_8.69.pdf" -> "รถ 55", "เทรลเลอร์เบอร์ 73_ST_8.69.pdf" -> "เทรลเลอร์
+ * 73" — matches the sheet-naming convention used in the approved ST_8.69
+ * reference workbook (verified against the user's own reference file).
+ */
+function normalizeTruckLabel(filename: string): string {
   const stem = filename.replace(/\.pdf$/i, "");
-  const cut = stem.indexOf("_");
-  return (cut > 0 ? stem.slice(0, cut) : stem).trim();
+  const numMatch = stem.match(/\d+/);
+  const num = numMatch ? numMatch[0] : "?";
+  return stem.includes("เทรลเลอร์") ? `เทรลเลอร์ ${num}` : `รถ ${num}`;
 }
 
 interface MasterEntry {
-  productCode: string | null; // null = customer-level entry (excluded customer, or a masterOverride not tied to one product)
+  customerName: string;
   distanceKm: number | null;
-  salesperson: string | null;
+  /** for a normal customer this is a roster name; for an excluded customer
+   *  it's a descriptive non-roster label (e.g. "รถมิเตอร์ (ไม่คิดค่าคอมการตลาด)")
+   *  so the T-column formula's roster check naturally zeroes it without any
+   *  separate exclusion mechanism — mirrors the approved reference file. */
+  salesperson: string;
   tag: "1สาย1สู้" | "ทางผ่าน" | "";
-  source: string;
+  sourceText: string;
 }
 
-/**
- * Resolve a customer+product against the parsed master rows. Prefers an
- * exact product match (a customer can have different distances per product
- * — e.g. KCL680317: G91 and DS both at 53 km, but that's not guaranteed in
- * general); falls back to ANY other row for that customer per the SKILL's
- * own reuse rule ("if a customer has multiple master rows for different
- * products with the same distance, reuse that distance for other products
- * — distance is about the delivery location, not the product"). Excluded
- * customers are stored with productCode=null so they match regardless of
- * product.
- */
-function resolveMaster(masterByCode: Map<string, MasterEntry[]>, customerCode: string, productCode: string): MasterEntry | null {
-  const entries = masterByCode.get(customerCode);
-  if (!entries || entries.length === 0) return null;
-  return entries.find((e) => e.productCode === productCode) ?? entries.find((e) => e.productCode === null) ?? entries[0];
+function buildMasterEntries(
+  branch: BranchConfig,
+  masterFileRows: { customerCode: string; customerName: string; distanceKm: number | null; salesperson: string | null; tag: "1สาย1สู้" | "ทางผ่าน" | "" }[],
+  masterFilename: string | null
+): Map<string, MasterEntry> {
+  const byCode = new Map<string, MasterEntry>();
+
+  // 1. excluded customers take priority over anything else — their เซลล์
+  // cell is set to a plainly non-roster descriptive label so the workbook's
+  // roster check zeroes their commission no matter what any master file
+  // says, matching the approved reference's own convention.
+  for (const ex of branch.excludedCustomers) {
+    byCode.set(ex.customerCode, {
+      customerName: `${ex.customerName} (ลูกค้ารถมิเตอร์)`,
+      distanceKm: null,
+      salesperson: "รถมิเตอร์ (ไม่คิดค่าคอมการตลาด)",
+      tag: "",
+      sourceText: `ลูกค้าของพนักงานขับรถมิเตอร์ - ไม่นับค่าคอมการตลาด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`,
+    });
+  }
+
+  // 2. the uploaded master file's own rows — one row per customer code,
+  // first occurrence wins if the source PDF lists the same customer more
+  // than once for different products (their distance is normally identical
+  // per the SKILL's own reuse rule; a genuine conflict is rare enough that
+  // picking the first-listed row is a reasonable default over blocking).
+  for (const row of masterFileRows) {
+    if (byCode.has(row.customerCode)) continue;
+    byCode.set(row.customerCode, {
+      customerName: row.customerName,
+      distanceKm: row.distanceKm,
+      salesperson: row.salesperson ?? "",
+      tag: row.tag,
+      sourceText: masterFilename ? `ไฟล์ '${branch.masterFileLabel}' (${branch.dataFolderLabel})` : "",
+    });
+  }
+
+  // 3. branch.masterOverrides fills any customer still missing entirely.
+  for (const ov of branch.masterOverrides) {
+    if (byCode.has(ov.customerCode)) continue;
+    const sourceText = ov.reuseFromCustomerCode
+      ? `ยืนยันจากผู้ใช้ (${branch.confirmDateLabel}) - ใช้ระยะทาง/เซลล์เดียวกับ ${ov.reuseFromCustomerCode}`
+      : `ยืนยันจากผู้ใช้ (${branch.confirmDateLabel}) - ไม่มีในไฟล์ master`;
+    byCode.set(ov.customerCode, {
+      customerName: ov.customerName,
+      distanceKm: ov.distanceKm,
+      salesperson: ov.salesperson,
+      tag: ov.tag ?? "",
+      sourceText,
+    });
+  }
+
+  return byCode;
 }
 
 export async function runCommissionPipeline(
@@ -71,36 +116,16 @@ export async function runCommissionPipeline(
   const warnings: string[] = [];
 
   // ---------- parse master (distance + เซลล์) ----------
-  // key: customer code, value: every row seen for that customer (one per
-  // product it can differ by). Excluded customers (branch.excludedCustomers)
-  // take priority over anything in the uploaded file — their เซลล์ is forced
-  // to "-" so the roster check in the workbook zeroes them out no matter
-  // what a master PDF happens to say. Then the uploaded file's own rows
-  // (this month's ground truth). Then branch.masterOverrides fills any
-  // remaining gap (a prior month's user-confirmed distance for a customer
-  // still missing from the file) — only for customers the file didn't
-  // already cover at all.
-  const masterByCode = new Map<string, MasterEntry[]>();
-  for (const ex of branch.excludedCustomers) {
-    masterByCode.set(ex.customerCode, [{ productCode: null, distanceKm: null, salesperson: "-", tag: "", source: `ตัดออก — ${ex.reason}` }]);
-  }
+  let masterFileRows: Awaited<ReturnType<typeof parseDistanceMasterText>>["rows"] = [];
   if (masterFile) {
     const masterText = await extractPdfText(masterFile.buffer);
     const parsedMaster = parseDistanceMasterText(masterText, branch.salespersonRoster);
     warnings.push(...parsedMaster.warnings.map((w) => `[master] ${w}`));
-    for (const row of parsedMaster.rows) {
-      if (branch.excludedCustomers.some((e) => e.customerCode === row.customerCode)) continue; // exclusion override wins
-      const list = masterByCode.get(row.customerCode) ?? [];
-      list.push({ productCode: row.productCode, distanceKm: row.distanceKm, salesperson: row.salesperson, tag: row.tag, source: `ไฟล์ master (${masterFile.filename})` });
-      masterByCode.set(row.customerCode, list);
-    }
+    masterFileRows = parsedMaster.rows;
   } else {
     warnings.push("[master] ไม่ได้แนบไฟล์ master ระยะทาง/เซลล์ — จะใช้เฉพาะข้อมูลที่ยืนยันไว้ล่วงหน้าใน config สาขา (masterOverrides) เท่านั้น");
   }
-  for (const ov of branch.masterOverrides) {
-    if (masterByCode.has(ov.customerCode)) continue; // file (or exclusion) already covers this customer
-    masterByCode.set(ov.customerCode, [{ productCode: ov.productCode ?? null, distanceKm: ov.distanceKm, salesperson: ov.salesperson, tag: ov.tag ?? "", source: ov.source }]);
-  }
+  const masterByCode = buildMasterEntries(branch, masterFileRows, masterFile?.filename ?? null);
 
   // ---------- parse AR (outstanding debt) ----------
   const arText = await extractPdfText(arFile.buffer);
@@ -118,9 +143,16 @@ export async function runCommissionPipeline(
   const truckLabels: string[] = [];
   const rosterSet = new Set(branch.salespersonRoster);
   const fuelSet = new Set(branch.fuelProductCodes);
+  // The sales-report parser's customer-header extraction is simple and
+  // reliable (a header line is just "<name> /<code>"); the distance-master
+  // PDF's own name text is not (it's reconstructed from a narrow, jumbled
+  // multi-column table with no reliable separators — see distanceMaster.ts).
+  // So the sales reports are the authoritative source for ชื่อลูกค้า in the
+  // Master sheet too, not the master file's own (unreliable) name guess.
+  const customerNameByCode = new Map<string, string>();
 
   for (const file of salesFiles) {
-    const truckLabel = truckLabelFromFilename(file.filename);
+    const truckLabel = normalizeTruckLabel(file.filename);
     truckLabels.push(truckLabel);
     const text = await extractPdfText(file.buffer);
     const parsed = parseSalesReportText(text);
@@ -141,11 +173,21 @@ export async function runCommissionPipeline(
       }
     }
 
+    let excelRow = 2; // row 1 is the header; only non-walk-in rows get a row here
     for (const line of parsed.lines) {
+      // A "-" customer code means a walk-in/pump-side cash sale with no
+      // customer record at all — it can never resolve a เซลล์ or earn
+      // commission, and the approved reference workbook leaves these out of
+      // the sheet entirely rather than listing them as an audit row.
+      if (line.customerCode === "-") continue;
+      if (line.customerNameRaw && !customerNameByCode.has(line.customerCode)) {
+        customerNameByCode.set(line.customerCode, line.customerNameRaw);
+      }
+
       const docPrefix = line.docNo.charAt(0).toUpperCase();
       const saleType = (branch.docPrefixToSaleType[docPrefix] ?? "unknown") as SaleType | "unknown";
 
-      const master = resolveMaster(masterByCode, line.customerCode, line.productCode);
+      const master = masterByCode.get(line.customerCode) ?? null;
       const distanceKm = master?.distanceKm ?? null;
       const salesperson = master?.salesperson ?? null;
       const freightForcedZero = master?.tag === "1สาย1สู้" || master?.tag === "ทางผ่าน";
@@ -177,6 +219,7 @@ export async function runCommissionPipeline(
 
       exportRows.push({
         truckLabel,
+        excelRow: excelRow++,
         docNo: line.docNo,
         baseDocNo: line.baseDocNo,
         docDate: line.date,
@@ -189,7 +232,7 @@ export async function runCommissionPipeline(
         saleType: saleType === "unknown" ? null : saleType,
         distanceKm,
         freightForcedZero,
-        masterSource: master?.source ?? null,
+        masterFound: master !== null,
         meterAnnotation: line.meterAnnotation,
         salesperson,
         outstandingAmount: null,
@@ -222,12 +265,10 @@ export async function runCommissionPipeline(
   // The SKILL uses two different scopes side by side in its own reference
   // numbers ("รายการเข้าเกณฑ์ 55 รายการ จาก 22 ลูกค้า รวม 154,000 ลิตร"):
   //  - transaction/customer COUNT = every row that passed the product +
-  //    qty/round-1000 gate (step 1), BEFORE the step-1b customer exclusion —
-  //    matches column V (เข้าเกณฑ์ปริมาณ) in the workbook, independent of
-  //    whether a เซลล์ ever resolves.
+  //    qty/round-1000 gate (step 1), BEFORE the step-1b customer exclusion.
   //  - liters/ค่าคอม = the same set MINUS excluded customers (ST57039 has
   //    qty-qualifying rows but contributes 0 liters/commission once
-  //    excluded) — matches the workbook's roster-gated T (ค่าคอม) column.
+  //    excluded).
   // Verified against the ST_8.69 reference: qtyQualifyingRows below comes to
   // exactly 55/22, and earningRows' liters/commission come to exactly
   // 154,000 ลิตร / ฿4,500.
@@ -243,11 +284,23 @@ export async function runCommissionPipeline(
     }
   }
 
+  const excludedCodes = new Set(branch.excludedCustomers.map((ex) => ex.customerCode));
+  const masterRows: MasterSheetRow[] = [...masterByCode.entries()].map(([customerCode, e]) => ({
+    customerCode,
+    customerName: excludedCodes.has(customerCode) ? e.customerName : customerNameByCode.get(customerCode) || e.customerName || customerCode,
+    salesperson: e.salesperson,
+    distanceKm: e.distanceKm,
+    tag: e.tag,
+    sourceText: e.sourceText,
+  }));
+
   const workbook = await buildCommissionWorkbook({
     branch,
     truckLabels,
     rows: exportRows,
+    masterRows,
     debtDeductionTotal,
+    debtQtyTotal: debtMatches.reduce((s, r) => s + r.qty, 0),
     standingNotes: branch.standingNotes,
     warnings,
   });

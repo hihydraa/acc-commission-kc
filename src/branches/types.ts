@@ -18,9 +18,12 @@ export interface MasterOverrideRow {
   distanceKm: number | null;
   salesperson: string;
   tag?: "1สาย1สู้" | "ทางผ่าน" | "";
-  /** why this row isn't in the master PDF and who confirmed it, e.g.
-   *  "ผู้ใช้ยืนยันทางแชท 2569-09-11 — ใช้เส้นทางเดียวกับ ST579612" */
-  source: string;
+  /** set when this row's distance/เซลล์ was copied from another customer's
+   *  confirmed master row rather than given directly (SKILL: "ใช้เส้นทาง/
+   *  ระยะทางเดียวกับ [an existing master entry]" — must still be recorded as
+   *  its own row with a "ที่มา" note explaining the reuse, never a silent
+   *  alias) */
+  reuseFromCustomerCode?: string;
 }
 
 export interface ExcludedCustomer {
@@ -33,6 +36,18 @@ export interface BranchConfig {
   id: string;
   label: string; // e.g. "สามทอง/โลจิสติกส์"
   companyName: string; // e.g. "หจก.สามทองบริการ"
+
+  /** Period this config's masterOverrides/exclusions were confirmed for —
+   *  e.g. periodLabel "8/69", periodLabelThai "ส.ค. 2569". A future month
+   *  needs its own re-confirmation (SKILL: never reuse without asking), so
+   *  these are descriptive labels for the หมายเหตุ/Master sheets, not a
+   *  guarantee the override data still applies next month. */
+  periodLabel: string;
+  periodLabelThai: string;
+  dataFolderLabel: string; // e.g. "ST_8.69" — the source-file folder name, for the หมายเหตุ sheet
+  masterFileLabel: string; // e.g. "ระยะทาง และ พนักงานขาย.pdf"
+  arAsOfLabel: string; // e.g. "7 ก.ย.69" — the debtor report's as-of date, as printed
+  confirmDateLabel: string; // e.g. "10 ก.ย.69" — when the user confirmed the overrides/exclusions below
 
   /** normalized product codes counted as "น้ำมันใส" for this branch, e.g. DS/G91/G95 */
   fuelProductCodes: string[];

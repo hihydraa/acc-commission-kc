@@ -75,7 +75,17 @@ export function parseDistanceMasterText(text: string, salespersonRoster: string[
   const fullText = text.replace(/\r?\n/g, " ").replace(/[ \t]+/g, " ");
   const codeMatches = [...fullText.matchAll(CUSTOMER_CODE_RE)];
 
-  let cursor = 0;
+  // The customer's own display NAME actually appears BEFORE their code
+  // (order per record: [seq][name][code][area][distance][product]
+  // [salesperson][tag]), glued directly onto the TAIL of the PREVIOUS
+  // record's segment with no separator. So `pendingNameStart` — the
+  // boundary carried from one iteration to the next — must point at the
+  // position right after the previous record's own salesperson+tag match,
+  // not at that previous record's segment end (which is the same position
+  // as the current code's start, collapsing the name-search window to zero
+  // width — this is display-only text, so a rough boundary here is fine,
+  // it doesn't need to be pixel-perfect).
+  let pendingNameStart = 0;
   for (let i = 0; i < codeMatches.length; i++) {
     const match = codeMatches[i];
     const customerCode = (match[1] ?? match[2]).toUpperCase();
@@ -85,32 +95,46 @@ export function parseDistanceMasterText(text: string, salespersonRoster: string[
     const segment = fullText.slice(codeEnd, segmentEnd);
 
     const nameGuess = fullText
-      .slice(cursor, codeStart)
+      .slice(pendingNameStart, codeStart)
       .replace(HEADER_NOISE_RE, " ")
       .replace(/^\s*\d+\s*/, "")
       .replace(/\s+/g, " ")
       .trim();
-    cursor = segmentEnd;
 
     const dp = segment.match(DISTANCE_PRODUCT_RE);
     if (!dp) {
       warnings.push(`ลูกค้า ${customerCode}: ไม่พบคอลัมน์ระยะทาง/สินค้า — ตรวจสอบไฟล์ master ต้นฉบับ`);
       rows.push({ customerCode, customerName: nameGuess || customerCode, productCode: null, distanceKm: null, salesperson: null, tag: "" });
+      pendingNameStart = segmentEnd;
       continue;
     }
     const distanceKm = dp[1] === "-" ? null : parseFloat(dp[1]);
     const productCode = dp[2];
-    const afterDp = segment.slice(dp.index! + dp[0].length);
+    const dpAbsoluteEnd = codeEnd + dp.index! + dp[0].length;
+    const afterDp = fullText.slice(dpAbsoluteEnd, segmentEnd);
 
     const sm = afterDp.match(rosterRe);
     let salesperson: string | null = null;
     let tag: DistanceMasterRow["tag"] = "";
     if (sm) {
       salesperson = sm[0];
-      const afterSalesperson = afterDp.slice(sm.index! + sm[0].length);
-      if (/^\d/.test(afterSalesperson)) tag = "1สาย1สู้";
+      const afterSalespersonStart = dpAbsoluteEnd + sm.index! + sm[0].length;
+      const afterSalesperson = fullText.slice(afterSalespersonStart, segmentEnd);
+      // "1สาย1สู้" glued directly onto the salesperson name (no space) — its
+      // own vowels are subject to the same font-corruption risk as the SKIL
+      // check above, so match loosely by shape (digit + short Thai run,
+      // twice) rather than the literal string, and consume it here so it
+      // doesn't bleed into the next record's name guess.
+      const tagMatch = afterSalesperson.match(/^\d\s*[ก-๙](?:\s?[ก-๙]){0,3}\s*\d\s*[ก-๙](?:\s?[ก-๙]){0,3}/);
+      if (tagMatch) {
+        tag = "1สาย1สู้";
+        pendingNameStart = afterSalespersonStart + tagMatch[0].length;
+      } else {
+        pendingNameStart = afterSalespersonStart;
+      }
     } else {
       warnings.push(`ลูกค้า ${customerCode}: ไม่พบชื่อเซลล์ที่ตรงกับ roster ในไฟล์ master — ตรวจสอบด้วยมือ`);
+      pendingNameStart = segmentEnd;
     }
     if (distanceKm === null && !tag) tag = "ทางผ่าน";
 

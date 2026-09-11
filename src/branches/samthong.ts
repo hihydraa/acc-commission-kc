@@ -10,6 +10,13 @@ export const samthongBranch: BranchConfig = {
   label: "สามทอง/โลจิสติกส์",
   companyName: "หจก.สามทองบริการ",
 
+  periodLabel: "8/69",
+  periodLabelThai: "ส.ค. 2569",
+  dataFolderLabel: "ST_8.69",
+  masterFileLabel: "ระยะทาง และ พนักงานขาย.pdf",
+  arAsOfLabel: "7 ก.ย.69",
+  confirmDateLabel: "10 ก.ย.69",
+
   fuelProductCodes: ["DS", "G91", "G95"],
   minQtyLiters: 2000,
   requireExactMultiple: true,
@@ -25,18 +32,20 @@ export const samthongBranch: BranchConfig = {
 
   salespersonRoster: ["จุ่น", "อุ้ย"],
 
-  excludedCustomers: [{ customerCode: "ST57039", customerName: "ATA ปิโตรเลียม", reason: "รถมิเตอร์ — ไม่ใช่ลูกค้าฝ่ายการตลาด" }],
+  excludedCustomers: [
+    { customerCode: "ST57039", customerName: "ATA ปิโตรเลียม", reason: "เป็นลูกค้าของพนักงานขับรถมิเตอร์ ไม่ใช่ลูกค้าของเซลล์การตลาด" },
+  ],
 
   // Confirmed with the user during the ST_8.69 (ส.ค. 2569) build — these 5
   // customers had a qualifying transaction but were missing from
   // "ระยะทาง และ พนักงานขาย.pdf" that month. Carried forward here so a future
   // run doesn't need to re-ask unless the master PDF itself gets updated.
   masterOverrides: [
-    { customerCode: "ST600116", customerName: "", distanceKm: 52, salesperson: "จุ่น", source: "ผู้ใช้ยืนยัน — ไม่มีใน master PDF (ส.ค. 2569)" },
-    { customerCode: "ST600136", customerName: "", distanceKm: 100, salesperson: "จุ่น", source: "ผู้ใช้ยืนยัน — ไม่มีใน master PDF (ส.ค. 2569)" },
-    { customerCode: "KCL680214", customerName: "", distanceKm: 41, salesperson: "อุ้ย", source: "ผู้ใช้ยืนยัน — ไม่มีใน master PDF (ส.ค. 2569)" },
-    { customerCode: "KCL690125", customerName: "", distanceKm: 105, salesperson: "จุ่น", source: "ผู้ใช้ยืนยัน — ไม่มีใน master PDF (ส.ค. 2569)" },
-    { customerCode: "ST57220", customerName: "แขวงทางหลวงชนบทกาฬสินธุ์", distanceKm: 20, salesperson: "จุ่น", source: "ผู้ใช้ยืนยัน — ใช้เส้นทางเดียวกับ ST579612 (ส.ค. 2569)" },
+    { customerCode: "ST600116", customerName: "มณฑิรา ภิบาลจอมมี", distanceKm: 52, salesperson: "จุ่น" },
+    { customerCode: "ST600136", customerName: "หจก.บุญตะวัน2023", distanceKm: 100, salesperson: "จุ่น" },
+    { customerCode: "KCL680214", customerName: "จิรัฐพัฒนาการเกษตร", distanceKm: 41, salesperson: "อุ้ย" },
+    { customerCode: "KCL690125", customerName: "ทรัพย์ทวี", distanceKm: 105, salesperson: "จุ่น" },
+    { customerCode: "ST57220", customerName: "แขวงทางหลวงชนบทกาฬสินธุ์", distanceKm: 20, salesperson: "จุ่น", reuseFromCustomerCode: "ST579612" },
   ],
 
   teamSplit: {
