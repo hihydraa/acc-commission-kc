@@ -232,6 +232,7 @@ export async function runCommissionPipeline(
         saleType: saleType === "unknown" ? null : saleType,
         distanceKm,
         freightForcedZero,
+        masterTag: master?.tag ?? "",
         masterFound: master !== null,
         meterAnnotation: line.meterAnnotation,
         salesperson,

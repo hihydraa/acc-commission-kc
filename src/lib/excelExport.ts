@@ -31,6 +31,10 @@ export interface ExportTransactionRow {
   saleType: "cash" | "credit" | "overdue" | null;
   distanceKm: number | null;
   freightForcedZero: boolean;
+  /** the raw tag text resolved from Master, for the cached H-column display
+   *  value — distinct from freightForcedZero, which is just "does this zero
+   *  the freight rate" (true for either tag value) */
+  masterTag: "1สาย1สู้" | "ทางผ่าน" | "";
   masterFound: boolean;
   meterAnnotation: string | null;
   salesperson: string | null;
@@ -70,6 +74,28 @@ function toThaiDateDisplay(ddmmyy: string): string {
   if (!m) return ddmmyy;
   const yearBE = 2500 + parseInt(m[3], 10);
   return `${m[1]}/${m[2]}/${yearBE}`;
+}
+
+/**
+ * exceljs has no formula engine, so a formula cell it writes carries no
+ * cached value — many non-Excel viewers (and Excel itself set to manual
+ * calculation) then render it as blank until something explicitly
+ * recalculates the sheet. Since the pipeline already computes every one of
+ * these values independently in JS (this IS the "independent calculation"
+ * cross-check the SKILL asks for), attach that value as the formula's
+ * cached `result` so every cell shows a correct number immediately on
+ * open — the formula itself stays live underneath for anyone who edits
+ * Master and wants Excel to recalculate for real.
+ */
+function fv(formula: string, result: number | string): { formula: string; result: number | string } {
+  return { formula, result };
+}
+
+function saleTypeLabel(t: "cash" | "credit" | "overdue" | null): string {
+  if (t === "cash") return "ขายสด";
+  if (t === "credit") return "ขายเชื่อ";
+  if (t === "overdue") return "ลูกหนี้ค้างชำระ";
+  return "ตรวจสอบ";
 }
 
 function safeSheetName(name: string, used: Set<string>): string {
@@ -164,6 +190,10 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       if (r.meterAnnotation) noteParts.push(`หมายเหตุจากไฟล์ขาย: "${r.meterAnnotation}" — ต้องยืนยันกับผู้ใช้ว่านับเป็นยอดเซลล์จริงหรือไม่`);
       if (r.outstandingAmount !== null) noteParts.push(`หักหนี้ค้างชำระ ฿${r.outstandingAmount.toLocaleString()} — พบในรายงานลูกหนี้ ณ ${branch.arAsOfLabel}`);
 
+      const gVal = r.distanceKm ?? "";
+      const hVal = r.masterTag || "";
+      const sVal = r.salesperson ?? "ตรวจสอบเซลล์";
+
       sheet.addRow([
         idx + 1,
         toThaiDateDisplay(r.docDate),
@@ -171,20 +201,20 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
         r.customerCode,
         r.customerName,
         productLabel(r.productCode),
-        { formula: `IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,3,FALSE()),"")` },
-        { formula: `IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,4,FALSE()),"")` },
+        fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,3,FALSE()),"")`, gVal),
+        fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,4,FALSE()),"")`, hVal),
         r.qty,
         r.saleValue,
         r.cost,
-        { formula: `IFERROR(J${excelRow}-K${excelRow},"")` },
-        { formula: freightFormula(excelRow) },
-        { formula: `IFERROR(M${excelRow}*I${excelRow},"")` },
-        { formula: `IFERROR(N${excelRow}+K${excelRow},"")` },
-        { formula: `IFERROR(J${excelRow}-O${excelRow},"")` },
-        { formula: `IFERROR(P${excelRow}/I${excelRow},"")` },
-        { formula: `IF(LEFT(C${excelRow},1)="H","ขายสด",IF(LEFT(C${excelRow},1)="I","ขายเชื่อ","ตรวจสอบ"))` },
-        { formula: `IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,2,FALSE()),"ตรวจสอบเซลล์")` },
-        { formula: commissionFormula(excelRow, branch) },
+        fv(`IFERROR(J${excelRow}-K${excelRow},"")`, r.calc.grossProfit),
+        fv(freightFormula(excelRow), r.calc.freightRate),
+        fv(`IFERROR(M${excelRow}*I${excelRow},"")`, r.calc.freightTotal),
+        fv(`IFERROR(N${excelRow}+K${excelRow},"")`, r.calc.totalCost),
+        fv(`IFERROR(J${excelRow}-O${excelRow},"")`, r.calc.profitAfterFreight),
+        fv(`IFERROR(P${excelRow}/I${excelRow},"")`, r.calc.profitPerLiter),
+        fv(`IF(LEFT(C${excelRow},1)="H","ขายสด",IF(LEFT(C${excelRow},1)="I","ขายเชื่อ","ตรวจสอบ"))`, saleTypeLabel(r.saleType)),
+        fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,2,FALSE()),"ตรวจสอบเซลล์")`, sVal),
+        fv(commissionFormula(excelRow, branch), r.calc.commission),
         noteParts.join("; "),
       ]);
     });
@@ -196,12 +226,15 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       const qualifyingRow = lastDataRow + 3;
       const qtyRange = `I2:I${lastDataRow}`;
       const qualifyCond = `(${qtyRange}>=${branch.minQtyLiters})*(MOD(${qtyRange},${branch.qtyMultipleOf})=0)`;
+      const totalQty = deptRows.reduce((s, r) => s + r.qty, 0);
+      const totalComm = deptRows.reduce((s, r) => s + r.calc.commissionNumeric, 0);
+      const qualifyingQty = deptRows.filter((r) => r.calc.qualifiesByQty).reduce((s, r) => s + r.qty, 0);
       sheet.getRow(totalRow).getCell(5).value = "รวมทั้งชีท";
-      sheet.getRow(totalRow).getCell(9).value = { formula: `SUM(${qtyRange})` };
-      sheet.getRow(totalRow).getCell(20).value = { formula: `SUM(T2:T${lastDataRow})` };
+      sheet.getRow(totalRow).getCell(9).value = fv(`SUM(${qtyRange})`, totalQty);
+      sheet.getRow(totalRow).getCell(20).value = fv(`SUM(T2:T${lastDataRow})`, totalComm);
       sheet.getRow(qualifyingRow).getCell(5).value = "รวมเฉพาะรายการที่เข้าเกณฑ์ค่าคอม";
-      sheet.getRow(qualifyingRow).getCell(9).value = { formula: `SUMPRODUCT(${qualifyCond}*${qtyRange})` };
-      sheet.getRow(qualifyingRow).getCell(20).value = { formula: `SUM(T2:T${lastDataRow})` };
+      sheet.getRow(qualifyingRow).getCell(9).value = fv(`SUMPRODUCT(${qualifyCond}*${qtyRange})`, qualifyingQty);
+      sheet.getRow(qualifyingRow).getCell(20).value = fv(`SUM(T2:T${lastDataRow})`, totalComm);
       sheet.getRow(totalRow).font = { bold: true };
       sheet.getRow(qualifyingRow).font = { bold: true };
     }
@@ -222,13 +255,13 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   for (const r of debtRows) {
     const s = truckSheetNameByLabel.get(r.truckLabel)!;
     debtSheet.addRow([
-      { formula: `'${s}'!D${r.excelRow}` },
-      { formula: `'${s}'!E${r.excelRow}` },
-      { formula: `'${s}'!C${r.excelRow}` },
-      { formula: `'${s}'!B${r.excelRow}` },
-      { formula: `'${s}'!I${r.excelRow}` },
-      { formula: `'${s}'!S${r.excelRow}` },
-      { formula: `'${s}'!T${r.excelRow}` },
+      fv(`'${s}'!D${r.excelRow}`, r.customerCode),
+      fv(`'${s}'!E${r.excelRow}`, r.customerName),
+      fv(`'${s}'!C${r.excelRow}`, r.docNo),
+      fv(`'${s}'!B${r.excelRow}`, toThaiDateDisplay(r.docDate)),
+      fv(`'${s}'!I${r.excelRow}`, r.qty),
+      fv(`'${s}'!S${r.excelRow}`, r.salesperson ?? "ตรวจสอบเซลล์"),
+      fv(`'${s}'!T${r.excelRow}`, r.calc.commission),
       r.arOutstandingReference,
     ]);
   }
@@ -236,9 +269,9 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   if (debtRows.length > 0) {
     debtSheet.addRow([]);
     debtSheet.getCell(`A${debtDataLast + 2}`).value = "รวมลิตรที่ต้องหัก";
-    debtSheet.getCell(`B${debtDataLast + 2}`).value = { formula: `SUM(E3:E${debtDataLast})` };
+    debtSheet.getCell(`B${debtDataLast + 2}`).value = fv(`SUM(E3:E${debtDataLast})`, input.debtQtyTotal);
     debtSheet.getCell(`A${debtDataLast + 3}`).value = "รวมค่าคอมที่ต้องหัก";
-    debtSheet.getCell(`B${debtDataLast + 3}`).value = { formula: `SUM(G3:G${debtDataLast})` };
+    debtSheet.getCell(`B${debtDataLast + 3}`).value = fv(`SUM(G3:G${debtDataLast})`, input.debtDeductionTotal);
     debtSheet.getRow(debtDataLast + 2).font = { bold: true };
     debtSheet.getRow(debtDataLast + 3).font = { bold: true };
     const noteStart = debtDataLast + 5;
@@ -269,8 +302,16 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     "ค่าคอมสุทธิ",
   ]);
   summarySheet.getRow(1).font = { bold: true };
+  const perSalesperson = branch.salespersonRoster.map((name) => {
+    const rows = input.rows.filter((r) => r.salesperson === name);
+    const liters = rows.filter((r) => r.calc.qualifiesByQty).reduce((s, r) => s + r.qty, 0);
+    const gross = rows.reduce((s, r) => s + r.calc.commissionNumeric, 0);
+    const debt = debtRows.filter((r) => r.salesperson === name).reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
+    return { name, liters, gross, debt, net: gross - debt };
+  });
   branch.salespersonRoster.forEach((name, i) => {
     const r = i + 2;
+    const agg = perSalesperson[i];
     const qtyTerms = input.truckLabels.map((label) => {
       const s = truckSheetNameByLabel.get(label)!;
       const last = truckLastRow.get(label) ?? 1;
@@ -283,16 +324,23 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     });
     summarySheet.addRow([
       name,
-      { formula: qtyTerms.join("+") },
-      { formula: commTerms.join("+") },
-      { formula: `SUMIF(หักหนี้ค้างชำระ!$F:$F,$A${r},หักหนี้ค้างชำระ!$G:$G)` },
-      { formula: `C${r}-D${r}` },
+      fv(qtyTerms.join("+"), agg.liters),
+      fv(commTerms.join("+"), agg.gross),
+      fv(`SUMIF(หักหนี้ค้างชำระ!$F:$F,$A${r},หักหนี้ค้างชำระ!$G:$G)`, agg.debt),
+      fv(`C${r}-D${r}`, agg.net),
     ]);
   });
   const grandRow = branch.salespersonRoster.length + 2;
   summarySheet.getRow(grandRow).getCell(1).value = "รวมทั้งหมด";
-  ["B", "C", "D", "E"].forEach((col) => {
-    summarySheet.getCell(`${col}${grandRow}`).value = { formula: `SUM(${col}2:${col}${grandRow - 1})` };
+  const grandTotals = {
+    liters: perSalesperson.reduce((s, a) => s + a.liters, 0),
+    gross: perSalesperson.reduce((s, a) => s + a.gross, 0),
+    debt: perSalesperson.reduce((s, a) => s + a.debt, 0),
+    net: perSalesperson.reduce((s, a) => s + a.net, 0),
+  };
+  (["B", "C", "D", "E"] as const).forEach((col, i) => {
+    const val = [grandTotals.liters, grandTotals.gross, grandTotals.debt, grandTotals.net][i];
+    summarySheet.getCell(`${col}${grandRow}`).value = fv(`SUM(${col}2:${col}${grandRow - 1})`, val);
   });
   summarySheet.getRow(grandRow).font = { bold: true };
   summarySheet.columns.forEach((c) => (c.width = 24));
@@ -312,28 +360,46 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   const colLetterForRoleIdx = (i: number) => String.fromCharCode("C".charCodeAt(0) + i);
   coverSheet.getRow(splitHeaderRow).values = ["เจ้าของยอด (เซลล์)", "ค่าคอมสุทธิ (บาท)", ...branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`)];
   coverSheet.getRow(splitHeaderRow).font = { bold: true };
+  const roleTotalsByCol = new Map<number, number>(); // 1-indexed column -> sum, for the รวม row
   branch.salespersonRoster.forEach((name, i) => {
     const srcRow = i + 2; // ค่าคอมรวม row for this salesperson
     const outRow = splitHeaderRow + 1 + i;
-    const cells: (string | number | { formula: string })[] = [name, { formula: `ค่าคอมรวม!E${srcRow}` }];
+    const net = perSalesperson[i].net;
+    const cells: (string | number | { formula: string; result: number | string })[] = [name, fv(`ค่าคอมรวม!E${srcRow}`, net)];
+    roleTotalsByCol.set(2, (roleTotalsByCol.get(2) ?? 0) + net);
+
+    const shares: number[] = [];
+    let fixedSum = 0;
+    branch.teamSplit.roles.forEach((role) => {
+      if (role.isRemainder) return;
+      const amt = Math.round(net * role.percent * 100) / 100;
+      shares.push(amt);
+      fixedSum += amt;
+    });
+    let fixedIdx = 0;
     branch.teamSplit.roles.forEach((role, roleIdx) => {
+      const col = roleIdx + 3; // C, D, E, ...
       if (role.isRemainder) {
+        const remainder = Math.round((net - fixedSum) * 100) / 100;
         const otherCols = branch.teamSplit.roles
           .map((_, j) => j)
           .filter((j) => j !== roleIdx)
           .map((j) => colLetterForRoleIdx(j) + outRow);
-        cells.push({ formula: `$B${outRow}${otherCols.length ? "-" + otherCols.join("-") : ""}` });
+        cells.push(fv(`$B${outRow}${otherCols.length ? "-" + otherCols.join("-") : ""}`, remainder));
+        roleTotalsByCol.set(col, (roleTotalsByCol.get(col) ?? 0) + remainder);
       } else {
-        cells.push({ formula: `ROUND($B${outRow}*${role.percent},2)` });
+        const amt = shares[fixedIdx++];
+        cells.push(fv(`ROUND($B${outRow}*${role.percent},2)`, amt));
+        roleTotalsByCol.set(col, (roleTotalsByCol.get(col) ?? 0) + amt);
       }
     });
     coverSheet.addRow(cells);
   });
   const totalRow = splitHeaderRow + 1 + branch.salespersonRoster.length;
-  const totalCells: (string | { formula: string })[] = ["รวม"];
+  const totalCells: (string | { formula: string; result: number | string })[] = ["รวม"];
   for (let c = 2; c <= branch.teamSplit.roles.length + 2; c++) {
     const col = String.fromCharCode("A".charCodeAt(0) + c - 1);
-    totalCells.push({ formula: `SUM(${col}${splitHeaderRow + 1}:${col}${totalRow - 1})` });
+    totalCells.push(fv(`SUM(${col}${splitHeaderRow + 1}:${col}${totalRow - 1})`, roleTotalsByCol.get(c) ?? 0));
   }
   coverSheet.getRow(totalRow).values = totalCells;
   coverSheet.getRow(totalRow).font = { bold: true };
