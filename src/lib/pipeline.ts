@@ -4,8 +4,8 @@ import { parseArReportText } from "./parser/arReport";
 import { parseDistanceMasterText } from "./parser/distanceMaster";
 import { ocrCustomerNamesFromMasterPdf } from "./parser/ocrNames";
 import { calculateTransaction, type SaleType, type TransactionCalcResult } from "./calc/commissionEngine";
-import type { BranchConfig } from "@/branches/types";
-import { buildCommissionWorkbook, type ExportTransactionRow, type MasterSheetRow } from "./excelExport";
+import type { BranchConfig, DepartmentConfig } from "@/branches/types";
+import { buildCommissionWorkbook, type ExportTransactionRow, type MasterSheetRow, type SheetScope } from "./excelExport";
 
 export interface InputFile {
   filename: string;
@@ -66,11 +66,11 @@ function buildMasterEntries(
   // says, matching the approved reference's own convention.
   for (const ex of branch.excludedCustomers) {
     byCode.set(ex.customerCode, {
-      customerName: `${ex.customerName} (ลูกค้ารถมิเตอร์)`,
+      customerName: `${ex.customerName} (ตัดออก)`,
       distanceKm: null,
-      salesperson: "รถมิเตอร์ (ไม่คิดค่าคอมการตลาด)",
+      salesperson: `ตัดออก - ไม่คิดค่าคอมการตลาด (${ex.reason})`,
       tag: "",
-      sourceText: `ลูกค้าของพนักงานขับรถมิเตอร์ - ไม่นับค่าคอมการตลาด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`,
+      sourceText: `${ex.reason} - ไม่นับค่าคอมการตลาด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`,
     });
   }
 
@@ -156,6 +156,7 @@ export async function runCommissionPipeline(
   // ---------- parse + calculate every sales file ----------
   const exportRows: ExportTransactionRow[] = [];
   const truckLabels: string[] = [];
+  const truckScopes = new Map<string, SheetScope>();
   const rosterSet = new Set(branch.salespersonRoster);
   const fuelSet = new Set(branch.fuelProductCodes);
   // The sales-report parser's customer-header extraction is simple and
@@ -167,10 +168,42 @@ export async function runCommissionPipeline(
   const customerNameByCode = new Map<string, string>();
 
   for (const file of salesFiles) {
-    const truckLabel = normalizeTruckLabel(file.filename);
-    truckLabels.push(truckLabel);
     const text = await extractPdfText(file.buffer);
     const parsed = parseSalesReportText(text);
+
+    // Branches with `departments` (e.g. กระนวน) are classified by the sales
+    // file's own "เลือกแผนก" header value (already extracted by the parser as
+    // `truckCode`) rather than by filename — a department's qty threshold
+    // and freight rule genuinely differ from another's (§2.1), so guessing
+    // wrong here would silently apply the wrong money rule to a whole file.
+    let department: DepartmentConfig | null = null;
+    let truckLabel: string;
+    if (branch.departments) {
+      department = branch.departments.find((d) => d.code === parsed.truckCode) ?? null;
+      if (!department) {
+        warnings.push(
+          `[${file.filename}] ไม่พบ 'เลือกแผนก' ที่ตรงกับแผนกที่ตั้งค่าไว้ (พบค่า: ${parsed.truckCode ?? "ไม่พบเลย"}) — ข้ามไฟล์นี้ทั้งหมด เพราะไม่ทราบเกณฑ์ปริมาณ/ค่าขนส่งที่ถูกต้อง ต้องตรวจสอบไฟล์และตั้งค่าแผนกให้ตรงก่อน`
+        );
+        continue;
+      }
+      truckLabel = department.label;
+      if (!department.docPrefixes.some((p) => parsed.lines.some((l) => l.docNo.toUpperCase().startsWith(p)))) {
+        warnings.push(`[${truckLabel}] เอกสารในไฟล์นี้ไม่ขึ้นต้นด้วย prefix ที่คาดไว้ (${department.docPrefixes.join("/")}) — ตรวจสอบว่าอัปโหลดไฟล์ถูกแผนกหรือไม่`);
+      }
+    } else {
+      truckLabel = normalizeTruckLabel(file.filename);
+    }
+    truckLabels.push(truckLabel);
+    if (!truckScopes.has(truckLabel)) {
+      truckScopes.set(
+        truckLabel,
+        department
+          ? { minQtyLiters: department.minQtyLiters, requireExactMultiple: department.requireExactMultiple, qtyMultipleOf: department.qtyMultipleOf, fixedFreightRate: department.fixedFreightRate }
+          : { minQtyLiters: branch.minQtyLiters!, requireExactMultiple: branch.requireExactMultiple!, qtyMultipleOf: branch.qtyMultipleOf!, fixedFreightRate: null }
+      );
+    }
+    const scope = truckScopes.get(truckLabel)!;
+
     warnings.push(...parsed.warnings.map((w) => `[${truckLabel}] ${w}`));
 
     if (parsed.grandTotal) {
@@ -202,10 +235,27 @@ export async function runCommissionPipeline(
       const docPrefix = line.docNo.charAt(0).toUpperCase();
       const saleType = (branch.docPrefixToSaleType[docPrefix] ?? "unknown") as SaleType | "unknown";
 
-      const master = masterByCode.get(line.customerCode) ?? null;
+      let master = masterByCode.get(line.customerCode) ?? null;
+      // A department whose whole roster is one fixed เซลล์ (กระนวน B3) never
+      // needs a master row at all — its customers aren't on a delivery
+      // route. Still synthesize one Master-sheet row per such customer (the
+      // first time it's seen) so the sheet's own VLOOKUP formula resolves
+      // "อ้อม" too, instead of only the JS-cached value knowing it — keeps
+      // the live formula and the cached result in agreement.
+      if (!master && department?.fixedSalesperson) {
+        master = {
+          customerName: customerNameByCode.get(line.customerCode) || line.customerNameRaw || line.customerCode,
+          distanceKm: null,
+          salesperson: department.fixedSalesperson,
+          tag: "",
+          sourceText: `แผนก ${department.label} (${department.code}) เป็นของเซลล์ "${department.fixedSalesperson}" คนเดียวทั้งแผนก (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel}) — ไม่มีในไฟล์ master`,
+        };
+        masterByCode.set(line.customerCode, master);
+      }
       const distanceKm = master?.distanceKm ?? null;
       const salesperson = master?.salesperson ?? null;
       const freightForcedZero = master?.tag === "1สาย1สู้" || master?.tag === "ทางผ่าน";
+      const masterFound = master !== null;
 
       const calc: TransactionCalcResult = calculateTransaction(
         {
@@ -216,17 +266,23 @@ export async function runCommissionPipeline(
           cost: line.cost,
           customerCode: line.customerCode,
           distanceKm,
+          fixedFreightRate: scope.fixedFreightRate,
           freightForcedZero,
-          masterFound: master !== null,
+          masterFound,
           saleType,
           salesperson,
         },
-        { thresholds: branch.thresholds, ratePerLiter: branch.ratePerLiter, penaltyNegativeQEnabled: branch.penaltyNegativeQEnabled },
+        {
+          thresholds: branch.thresholds,
+          ratePerLiter: branch.ratePerLiter,
+          penaltyNegativeQEnabled: branch.penaltyNegativeQEnabled,
+          freightMissingBehavior: branch.freightMissingBehavior,
+        },
         {
           fuelProductCodes: fuelSet,
-          minQtyLiters: branch.minQtyLiters,
-          requireExactMultiple: branch.requireExactMultiple,
-          qtyMultipleOf: branch.qtyMultipleOf,
+          minQtyLiters: scope.minQtyLiters,
+          requireExactMultiple: scope.requireExactMultiple,
+          qtyMultipleOf: scope.qtyMultipleOf,
           salespersonRoster: rosterSet,
         },
         branch.freightTiers
@@ -248,7 +304,7 @@ export async function runCommissionPipeline(
         distanceKm,
         freightForcedZero,
         masterTag: master?.tag ?? "",
-        masterFound: master !== null,
+        masterFound,
         meterAnnotation: line.meterAnnotation,
         salesperson,
         outstandingAmount: null,
@@ -298,6 +354,9 @@ export async function runCommissionPipeline(
         warnings.push(`[${r.truckLabel}] ${r.customerCode} เอกสาร ${r.docNo}: ${f}`);
       }
     }
+    if (r.calc.blocked) {
+      warnings.push(`[${r.truckLabel}] ${r.customerCode} เอกสาร ${r.docNo}: ${r.calc.blockedReason} — ยังไม่นับค่าคอมแถวนี้จนกว่าจะแก้ไข`);
+    }
   }
 
   const excludedCodes = new Set(branch.excludedCustomers.map((ex) => ex.customerCode));
@@ -328,6 +387,7 @@ export async function runCommissionPipeline(
   const workbook = await buildCommissionWorkbook({
     branch,
     truckLabels,
+    truckScopes,
     rows: exportRows,
     masterRows,
     debtDeductionTotal,

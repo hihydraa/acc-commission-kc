@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getBranchById, BRANCHES } from "@/branches/samthong";
+import { getBranchById, BRANCHES } from "@/branches";
 import { runCommissionPipeline, type InputFile } from "@/lib/pipeline";
 
 export const runtime = "nodejs";

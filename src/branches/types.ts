@@ -32,6 +32,34 @@ export interface ExcludedCustomer {
   reason: string; // e.g. "รถมิเตอร์ — ATA ปิโตรเลียม"
 }
 
+/**
+ * A branch whose sales files self-identify a "เลือกแผนก" (department) code in
+ * their header — e.g. กระนวน's A7/B7/68/B3 — needs its own qty threshold and
+ * freight rule PER DEPARTMENT rather than one flat branch-wide rule (สามทอง's
+ * model). Set `BranchConfig.departments` for this case instead of the flat
+ * minQtyLiters/requireExactMultiple/qtyMultipleOf fields; the pipeline reads
+ * `parseSalesReportText()`'s already-extracted `truckCode` (the "เลือกแผนก"
+ * value) to pick the matching entry per uploaded file.
+ */
+export interface DepartmentConfig {
+  code: string; // e.g. 'A7', 'B7', '68', 'B3' — matches the "เลือกแผนก" header value
+  label: string; // e.g. "เบอร์60" — used as the sheet name
+  docPrefixes: string[]; // e.g. ['HDA','IDA'] — validation only, warns on a mismatched upload
+  minQtyLiters: number;
+  requireExactMultiple: boolean;
+  qtyMultipleOf: number;
+  /** null = use the branch's freightTiers table; a number overrides the
+   *  table entirely with a fixed ค่าขนส่ง/ลิตร (e.g. กระนวน B3's 0.10) */
+  fixedFreightRate: number | null;
+  /** null = resolve เซลล์ per customer via the master file, as usual. A name
+   *  means every transaction in this department belongs to that one เซลล์
+   *  regardless of customer — confirmed for กระนวน B3 (กรอกหลังปั๊ม) directly
+   *  with the user: that department's customers (filled at the pump, not on
+   *  a delivery route) never appear in the distance/เซลล์ master file at
+   *  all, and the whole department is one เซลล์'s alone (ยืนยันจากผู้ใช้). */
+  fixedSalesperson: string | null;
+}
+
 export interface BranchConfig {
   id: string;
   label: string; // e.g. "สามทอง/โลจิสติกส์"
@@ -51,9 +79,14 @@ export interface BranchConfig {
 
   /** normalized product codes counted as "น้ำมันใส" for this branch, e.g. DS/G91/G95 */
   fuelProductCodes: string[];
-  minQtyLiters: number;
-  requireExactMultiple: boolean;
-  qtyMultipleOf: number;
+  /** Flat single-scope model (สามทอง). Omit all three and set `departments`
+   *  instead for a branch classified by "เลือกแผนก" (กระนวน). */
+  minQtyLiters?: number;
+  requireExactMultiple?: boolean;
+  qtyMultipleOf?: number;
+  /** per-department qty threshold + freight override, keyed by the sales
+   *  file's own "เลือกแผนก" header value — see DepartmentConfig. */
+  departments?: DepartmentConfig[];
 
   /** first letter of the sales document number -> ประเภท, e.g. {H: cash, I: credit} */
   docPrefixToSaleType: Record<string, SaleType>;
@@ -63,6 +96,15 @@ export interface BranchConfig {
   penaltyNegativeQEnabled: boolean;
 
   freightTiers: FreightTier[];
+  /** what M (ค่าขนส่ง/ลิตร) should do when a qualifying row's distance is
+   *  missing from Master or falls outside freightTiers, and no fixed rate
+   *  applies. "defaultZero" (สามทอง's approved template behavior) computes
+   *  M=0 and just flags it for review; "block" (กระนวน's confirmed v2 spec —
+   *  a stricter rule found necessary for that branch after v1 silently
+   *  defaulting to 0 was found to overpay commission) refuses to compute a
+   *  number at all until the row is resolved. Branch-specific — never
+   *  assume one applies to the other. */
+  freightMissingBehavior: "defaultZero" | "block";
 
   /** the branch's recognized marketing เซลล์ — anyone else the master file
    *  resolves to gets their commission forced to 0 */

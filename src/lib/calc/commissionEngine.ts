@@ -14,15 +14,24 @@ export type SaleType = "cash" | "credit" | "overdue";
  * different specs instead of verifying one.
  *
  * Key template behavior worth calling out because it's more lenient than a
- * naive read of the SKILL text would suggest: the M (ค่าขนส่ง/ลิตร) formula
- * NEVER blocks — a missing distance, a distance outside the freight table,
- * or a customer entirely absent from Master all resolve to M=0 rather than
- * an error. That is safe ONLY because the pipeline is expected to have
- * already resolved every qualifying customer's distance/เซลล์ into the
- * Master sheet (asking the user for anything missing) before this workbook
- * is finalized — so this module still raises a `flags` entry for "no master
- * row at all" and "distance outside the table" so those gaps stay visible
- * to a reviewer, even though the number itself doesn't stop being computed.
+ * naive read of the SKILL text would suggest: สามทอง's approved template's M
+ * (ค่าขนส่ง/ลิตร) formula NEVER blocks — a missing distance, a distance
+ * outside the freight table, or a customer entirely absent from Master all
+ * resolve to M=0 rather than an error. That is safe ONLY because the
+ * pipeline is expected to have already resolved every qualifying customer's
+ * distance/เซลล์ into the Master sheet (asking the user for anything
+ * missing) before this workbook is finalized — so this module still raises a
+ * `flags` entry for "no master row at all" and "distance outside the table"
+ * so those gaps stay visible to a reviewer, even though the number itself
+ * doesn't stop being computed.
+ *
+ * This is genuinely branch-specific, not a universal rule — see
+ * CommissionConfig.freightMissingBehavior. กระนวน's own confirmed v2 spec
+ * found that v1's identical "default to 0" behavior silently overstated
+ * profit-per-liter and overpaid commission, and requires BLOCKING that row
+ * instead (never guessing M) until a human resolves it. Both behaviors live
+ * in this one function, selected per branch — never hardcode one branch's
+ * choice as if it were universal.
  */
 export interface EligibilityConfig {
   fuelProductCodes: Set<string>;
@@ -49,6 +58,9 @@ export interface CommissionConfig {
    *  user even though it defaults on (matched every real transaction seen
    *  so far). */
   penaltyNegativeQEnabled: boolean;
+  /** see BranchConfig.freightMissingBehavior — "defaultZero" (สามทอง) or
+   *  "block" (กระนวน's confirmed v2 spec) */
+  freightMissingBehavior: "defaultZero" | "block";
 }
 
 export interface TransactionInput {
@@ -59,6 +71,9 @@ export interface TransactionInput {
   cost: number;
   customerCode: string;
   distanceKm: number | null;
+  /** null = look up ค่าขนส่ง/ลิตร from the freight table as usual; a number
+   *  overrides the table entirely (e.g. กระนวน B3's fixed 0.10) */
+  fixedFreightRate: number | null;
   /** the "1สาย1สู้" tag, or "ทางผ่าน" / no master row at all — every one of
    *  these zeroes the freight rate per the template's M formula */
   freightForcedZero: boolean;
@@ -75,17 +90,24 @@ export interface TransactionCalcResult {
   /** true once product/qty/round-multiple scope (column V, "เข้าเกณฑ์ปริมาณ") passes */
   qualifiesByQty: boolean;
   flags: string[];
+  /** true when freightMissingBehavior="block" and M genuinely can't be
+   *  computed (missing/out-of-range distance, no fixed rate, not tag-zeroed)
+   *  — L/N/O/P/Q/commission are all null in this case, the row still needs a
+   *  human to supply a distance or confirm 1สาย1สู้/ทางผ่าน before it counts
+   *  toward any total. */
+  blocked: boolean;
+  blockedReason: string | null;
   grossProfit: number; // L
-  freightRate: number; // M — never null, template default is 0
-  freightTotal: number; // N
-  totalCost: number; // O
-  profitAfterFreight: number; // P
-  profitPerLiter: number; // Q
-  /** T — a number, OR the literal template sentinel string when ประเภท
-   *  can't be resolved (SUM() in Excel silently skips text, so this stays
-   *  visible in the cell without breaking downstream totals) */
-  commission: number | "ตรวจสอบประเภท(R)";
-  /** commission as a plain number for aggregation (0 when it's the sentinel) */
+  freightRate: number | null; // M — null only when blocked
+  freightTotal: number | null; // N
+  totalCost: number | null; // O
+  profitAfterFreight: number | null; // P
+  profitPerLiter: number | null; // Q
+  /** T — a number, OR a literal sentinel string when ประเภท can't be
+   *  resolved or the row is blocked (SUM() in Excel silently skips text, so
+   *  this stays visible in the cell without breaking downstream totals) */
+  commission: number | "ตรวจสอบประเภท(R)" | "ต้องตรวจสอบระยะทาง(M)";
+  /** commission as a plain number for aggregation (0 for any sentinel) */
   commissionNumeric: number;
 }
 
@@ -102,31 +124,70 @@ export function calculateTransaction(
   freightTiers: FreightTier[] = DEFAULT_FREIGHT_TIERS
 ): TransactionCalcResult {
   const flags: string[] = [];
-  if (!tx.masterFound) flags.push("ไม่พบลูกค้านี้ในไฟล์ master เลย — VLOOKUP ระยะทาง/เซลล์ว่าง, M=0 โดยดีฟอลต์ (ต้องยืนยันระยะทาง/เซลล์กับผู้ใช้)");
+  const isMasterDefaultZeroBranch = config.freightMissingBehavior === "defaultZero";
+  if (!tx.masterFound) {
+    flags.push(
+      isMasterDefaultZeroBranch
+        ? "ไม่พบลูกค้านี้ในไฟล์ master เลย — VLOOKUP ระยะทาง/เซลล์ว่าง, M=0 โดยดีฟอลต์ (ต้องยืนยันระยะทาง/เซลล์กับผู้ใช้)"
+        : "ไม่พบลูกค้านี้ในไฟล์ master เลย — ต้องเพิ่มระยะทาง/เซลล์ก่อนจึงจะคำนวณค่าคอมได้"
+    );
+  }
 
-  const L = new Decimal(tx.saleValue).minus(tx.cost);
+  const qualifiesByQty = eligibility.fuelProductCodes.has(tx.productCode) && passesQtyRule(tx.qty, eligibility);
 
-  let M: Decimal;
+  let M: Decimal | null;
+  let blocked = false;
+  let blockedReason: string | null = null;
   if (tx.freightForcedZero) {
     M = new Decimal(0);
+  } else if (tx.fixedFreightRate !== null) {
+    M = new Decimal(tx.fixedFreightRate);
   } else if (tx.distanceKm === null) {
-    M = new Decimal(0);
+    if (isMasterDefaultZeroBranch) {
+      M = new Decimal(0);
+    } else {
+      M = null;
+      blocked = true;
+      blockedReason = "ไม่มีระยะทางในไฟล์ master — ต้องกรอกระยะทางหรือติ๊ก 1สาย1สู้/ทางผ่านก่อน";
+    }
   } else {
     const rate = lookupFreightRate(tx.distanceKm, freightTiers);
     if (rate === FREIGHT_BLOCK) {
-      flags.push(`ระยะทาง ${tx.distanceKm} กม. ไม่อยู่ในตารางค่าขนส่ง — ใช้ M=0 โดยดีฟอลต์ (ต้องตรวจสอบ)`);
-      M = new Decimal(0);
+      if (isMasterDefaultZeroBranch) {
+        flags.push(`ระยะทาง ${tx.distanceKm} กม. ไม่อยู่ในตารางค่าขนส่ง — ใช้ M=0 โดยดีฟอลต์ (ต้องตรวจสอบ)`);
+        M = new Decimal(0);
+      } else {
+        M = null;
+        blocked = true;
+        blockedReason = `ระยะทาง ${tx.distanceKm} กม. เกิน 209 กม. หรือไม่อยู่ในตารางค่าขนส่ง — ต้องระบุค่าขนส่ง/ลิตรเองก่อน`;
+      }
     } else {
       M = new Decimal(rate);
     }
   }
 
+  if (blocked || M === null) {
+    return {
+      qualifiesByQty,
+      flags,
+      blocked: true,
+      blockedReason,
+      grossProfit: new Decimal(tx.saleValue).minus(tx.cost).toNumber(),
+      freightRate: null,
+      freightTotal: null,
+      totalCost: null,
+      profitAfterFreight: null,
+      profitPerLiter: null,
+      commission: "ต้องตรวจสอบระยะทาง(M)",
+      commissionNumeric: 0,
+    };
+  }
+
+  const L = new Decimal(tx.saleValue).minus(tx.cost);
   const N = M.times(tx.qty);
   const O = N.plus(tx.cost);
   const P = new Decimal(tx.saleValue).minus(O);
   const Q = tx.qty === 0 ? new Decimal(0) : P.div(tx.qty);
-
-  const qualifiesByQty = eligibility.fuelProductCodes.has(tx.productCode) && passesQtyRule(tx.qty, eligibility);
 
   // Mirrors the template's T formula exactly: OR(I="",R="") -> 0; then the
   // qty/multiple-of-1000 gate -> 0; then the roster COUNTIF gate -> 0; then
@@ -155,6 +216,8 @@ export function calculateTransaction(
   return {
     qualifiesByQty,
     flags,
+    blocked: false,
+    blockedReason: null,
     grossProfit: L.toNumber(),
     freightRate: M.toNumber(),
     freightTotal: N.toNumber(),

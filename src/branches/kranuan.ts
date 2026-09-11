@@ -1,0 +1,87 @@
+import { DEFAULT_FREIGHT_TIERS } from "@/lib/calc/freightTable";
+import type { BranchConfig } from "./types";
+
+/**
+ * สาขากระนวน (สามทอง/โลจิสติกส์) — classified by "เลือกแผนก" (department) in
+ * each sales report's own header, not by truck-per-file the way สามทอง's
+ * flat model is. Built from and regression-tested against the branch's own
+ * confirmed v2 spec ("# สเปคระบบคำนวณค่าคอมมิชชั่นการตลาด_V2.txt", ยืนยันกับ
+ * PDF ต้นทางจริงทีละบรรทัด) and its approved reference workbook ("ค่าคอม KN
+ * เดือน 8-69.xlsx") — NOT copied from สามทอง's rules; every number below was
+ * independently confirmed for this branch, and several genuinely differ from
+ * สามทอง (see inline notes).
+ */
+export const kranuanBranch: BranchConfig = {
+  id: "kranuan",
+  label: "กระนวน",
+  companyName: "หจก.สามทองบริการ",
+
+  periodLabel: "8/69",
+  periodLabelThai: "ส.ค. 2569",
+  dataFolderLabel: "KN_8.69",
+  masterFileLabel: "ระยะทาง + เชลล์ 2.pdf",
+  arAsOfLabel: "7 ก.ย.69",
+  confirmDateLabel: "11 ก.ย.69",
+
+  // ดีเซล-1(DS)/ดีเซล-2(DS2)/ดีเซลบี20(DSB20)/G91/G95 — "น้ำมันทุกชนิด" ต่างจาก
+  // สามทองตรงที่มี DS2/DSB20 เพิ่ม (ยืนยันจากสเปค §4.1 และ commissionEngine.test.ts เดิม)
+  fuelProductCodes: ["DS", "DS2", "DSB20", "G91", "G95"],
+
+  // ไม่มี minQtyLiters/requireExactMultiple/qtyMultipleOf แบบ flat — ใช้
+  // departments แทน เพราะแต่ละแผนกมีเกณฑ์ปริมาณต่างกัน (สเปค §2.1, §4.1)
+  departments: [
+    { code: "A7", label: "เบอร์60", docPrefixes: ["HDA", "IDA"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null },
+    { code: "B7", label: "เบอร์67", docPrefixes: ["HDB", "IDB"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null },
+    { code: "68", label: "เทรลเลอร์68", docPrefixes: ["HD", "ID"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null },
+    // กรอกหลังปั๊ม: ลูกค้าเติมที่หน้าปั๊มโดยตรง ไม่ได้อยู่ในเส้นทางรถส่ง จึงไม่มีใน
+    // ไฟล์ master ระยะทาง/เซลล์เลย — ทั้งแผนกเป็นของเซลล์ "อ้อม" คนเดียวเสมอ
+    // (ยืนยันจากผู้ใช้ 11 ก.ย.69 หลังตรวจสอบกับไฟล์อ้างอิงที่ทุกแถวเป็นอ้อม)
+    { code: "B3", label: "กรอกหลังปั๊ม", docPrefixes: ["HSB", "IVB", "IV"], minQtyLiters: 1000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: 0.1, fixedSalesperson: "อ้อม" },
+  ],
+
+  docPrefixToSaleType: { H: "cash", I: "credit" },
+
+  // เกณฑ์กำไรต่อลิตร/อัตราค่าคอม/บทลงโทษ Q ติดลบ — ยืนยันแยกต่างหากจากสเปค §4.3
+  // และ §8 ของสาขานี้เอง (ไม่ได้อิงจากสามทอง) บังเอิญเท่ากันเพราะเป็นนโยบาย
+  // Incentive เดียวกันของบริษัท
+  thresholds: { cash: 0.2, credit: 0.3, overdue: 0.6 },
+  ratePerLiter: 0.03,
+  penaltyNegativeQEnabled: true,
+
+  freightTiers: DEFAULT_FREIGHT_TIERS,
+  // ต่างจากสามทอง: ห้ามให้ M default เป็น 0 เมื่อไม่มีระยะทาง/เกิน 209 กม. —
+  // สเปค v2 §0 บั๊ก #1/#2 พบว่า v1 (default 0) ทำให้จ่ายค่าคอมเกินจริง
+  freightMissingBehavior: "block",
+
+  salespersonRoster: ["อ้อม", "ต้อม", "วีระ"],
+
+  // "สด /KNDC0018" — ลูกค้าบัตรเติมน้ำมันรายวัน คนละประเภทลูกค้ากับลูกค้า
+  // เซลล์การตลาด (ยืนยันจากไฟล์อ้างอิงที่ผู้ใช้ส่งมา + สเปค §4.1/§8 — ทำให้เสีย
+  // ค่าคอม 63.81 บาท/เดือน ซึ่งเป็นนโยบายที่ตั้งใจ ไม่ใช่บั๊ก)
+  excludedCustomers: [
+    { customerCode: "KNDC0018", customerName: "สด (บัตรเติมน้ำมันรายวัน)", reason: "ลูกค้าบัตรเติมน้ำมันรายวัน คนละประเภทลูกค้ากับลูกค้าเซลล์การตลาด" },
+  ],
+
+  // ยังไม่พบลูกค้าที่ต้องเพิ่มเองนอกไฟล์ master ในรอบตรวจสอบครั้งนี้ — ถ้าเดือน
+  // ถัดไปมีลูกค้าใหม่ที่ไม่มีใน master ให้ยืนยันกับผู้ใช้ก่อนเพิ่มที่นี่ (ห้ามเดา)
+  masterOverrides: [],
+
+  // อัตราแบ่งทีม 10/60/20/10 — ยืนยันแยกต่างหากจากสเปค §4.6 ของสาขานี้เอง
+  // (บังเอิญเท่ากับสามทองเพราะเป็นนโยบายเดียวกันของบริษัท ไม่ใช่การเดา)
+  teamSplit: {
+    roles: [
+      { key: "manager", label: "ผู้จัดการ เค.ซี.ปิโตรเลียม", percent: 0.1 },
+      { key: "sales", label: "เจ้าหน้าที่การตลาด (เจ้าของยอด)", percent: 0.6, isRemainder: true },
+      { key: "admin", label: "ADMIN (บัญชีสาขา,ธุรการ,คลังน้ำมัน)", percent: 0.2 },
+      { key: "central", label: "ส่วนกลางการตลาด", percent: 0.1 },
+    ],
+  },
+
+  standingNotes: [
+    "บทลงโทษกำไรต่อลิตรติดลบ (หัก 3 สต./ลิตร) ไม่ได้เขียนไว้ในประกาศ Incentive — เป็นแนวปฏิบัติภายในที่ยึดตามข้อมูลจริง เช่นเดียวกับสาขาอื่น",
+    "เกณฑ์ปริมาณขั้นต่ำของสาขานี้เป็นแบบ 'มากกว่าหรือเท่ากับ' ล้วนๆ ไม่มีเงื่อนไข 'ต้องลงท้ายพันพอดี' ในทุกแผนก (ต่างจากสามทอง) — ยืนยันจากไฟล์อ้างอิงจริงที่มีบิลปริมาณเศษ เช่น 1,470.25 ลิตร ที่ยังเข้าเกณฑ์",
+    "แถวที่ระบบ 'ต้องตรวจสอบระยะทาง(M)' คือแถวที่ไม่มีระยะทางใน master หรือระยะทางเกิน 209 กม. — ต้องกรอกระยะทางหรือยืนยันแท็ก 1สาย1สู้/ทางผ่านก่อนจึงจะคำนวณค่าคอมแถวนั้นได้ (ไม่รวมในยอดจนกว่าจะแก้)",
+    "การจับคู่หักหนี้ค้างชำระในระบบนี้ยังไม่ได้กรองเฉพาะบิลที่ลงวันที่อยู่ในเดือนที่คำนวณ (สเปค §5.3 ข้อ 3) — รายงานลูกหนี้ ณ 7 ก.ย. อาจมีบิลเดือน ก.ย. ปนมาที่เลขเอกสารบังเอิญซ้ำกับบิลเดือน ส.ค. ได้ในทางทฤษฎี (ยังไม่พบจริงในรอบนี้) ควรตรวจสอบทุกแถวในชีทหักหนี้ค้างชำระก่อนใช้ตัวเลข",
+    "ลูกค้า KCL660037 ปั๊มปุ๊บริการ ระยะทางในไฟล์ master เขียนว่า 'ทางผ่าน' (ไม่ใช่ตัวเลข) — ใช้ค่าขนส่ง/ลิตร=0 ตามแท็ก ควรยืนยันกับผู้ใช้ทุกเดือนว่ายังถูกต้องอยู่",
+  ],
+};

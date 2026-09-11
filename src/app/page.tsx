@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { BRANCHES } from "@/branches/samthong";
+import { BRANCHES } from "@/branches";
 
 interface CalcSummary {
   truckCount: number;
@@ -112,8 +112,10 @@ export default function Home() {
             </select>
             {branch && (
               <p className="mt-1 text-xs text-neutral-500">
-                เซลล์ในสาขานี้: {branch.salespersonRoster.join(", ")} · สินค้าที่นับ: {branch.fuelProductCodes.join(", ")} · เกณฑ์ ≥
-                {branch.minQtyLiters.toLocaleString()} ลิตร{branch.requireExactMultiple ? ` (หาร ${branch.qtyMultipleOf} ลงตัว)` : ""}
+                เซลล์ในสาขานี้: {branch.salespersonRoster.join(", ")} · สินค้าที่นับ: {branch.fuelProductCodes.join(", ")} ·{" "}
+                {branch.departments
+                  ? `เกณฑ์แยกตามแผนก: ${branch.departments.map((d) => `${d.label} ≥${d.minQtyLiters.toLocaleString()}ล.`).join(", ")}`
+                  : `เกณฑ์ ≥${(branch.minQtyLiters ?? 0).toLocaleString()} ลิตร${branch.requireExactMultiple ? ` (หาร ${branch.qtyMultipleOf} ลงตัว)` : ""}`}
               </p>
             )}
           </div>

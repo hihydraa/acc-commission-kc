@@ -19,13 +19,17 @@ import type { ParsedDistanceMaster, DistanceMasterRow } from "./types";
  * regardless of missing whitespace.
  *
  * Within a segment the fixed order is: [area text] [distance-or-"-"]
- * [product code, e.g. DS/G91/G95] [salesperson name] [optional tag]. The
- * distance+product pair is matched together (a bare number could otherwise
- * be confused with area/index text); the salesperson is matched against the
- * branch's own roster (config-driven, never guessed) rather than a generic
- * "any Thai text" pattern, because that's the only way to tell the
- * salesperson name apart from the NEXT record's leading index+name that
- * inevitably gets glued on with no separator.
+ * [product code, e.g. DS/G91/G95 — สามทอง's file has this column, กระนวน's
+ * does NOT] [salesperson name] [optional tag]. Rather than require a product
+ * code (which would break on a branch whose master file omits that column
+ * entirely — confirmed against กระนวน's real file), the salesperson is
+ * matched first, against the branch's own roster (config-driven, never
+ * guessed — this is also the only way to tell the salesperson name apart
+ * from the NEXT record's leading index+name that inevitably gets glued on
+ * with no separator), and the distance is then read as the LAST bare
+ * number/"-" token appearing before that match — a product code token like
+ * "G91" never satisfies a whitespace-bounded all-digit match, so it's
+ * naturally skipped over whether or not it's present.
  *
  * A garbled-font quirk specific to this PDF's embedded font consistently
  * renders สาย (SARA AA, า) as สำย (SARA AM, ำ) in extracted text — verified
@@ -55,7 +59,16 @@ import type { ParsedDistanceMaster, DistanceMasterRow } from "./types";
 // lookbehind since without a letter prefix, a stray run of 6+ digits needs
 // more protection against accidentally matching inside an unrelated number.
 const CUSTOMER_CODE_RE = /(?<![A-Za-z])([A-Za-z]{1,5}\d{4,})(?![A-Za-z0-9])|(?<![A-Za-z0-9])(\d{6,})(?![A-Za-z0-9])/g;
-const DISTANCE_PRODUCT_RE = /(\d+(?:\.\d+)?|-)\s*([A-Z][A-Z0-9]{1,4})/;
+// A distance token must not be preceded by a Latin letter/digit (never
+// matches the "91" inside a glued-on "G91", or a code's own trailing
+// digits) — but IS commonly glued directly onto Thai area text with zero
+// whitespace on either side (both branches' files do this — e.g. สามทอง's
+// "กุฉินารายณ์84 DS" and กระนวน's "เขาสวนกวาง13       อ้อม" both have no
+// space before the number), so a Thai character or start-of-segment is a
+// valid left boundary. The right side may likewise run directly into a
+// following letter with no space (สามทอง's "84DS"-style zero-gap product
+// code column, which กระนวน's file doesn't have at all).
+const DISTANCE_TOKEN_RE = /(?<![A-Za-z0-9.])(-|\d+(?:\.\d+)?)(?=\s|[A-Za-z]|$)/g;
 const HEADER_NOISE_RE = /ระยะทาง|เซลล์|ลำดับ|ชื่อลูกค้า|รหัส|พื้นที่|กม\.?|สินค้า/g;
 
 function escapeRegExp(s: string): string {
@@ -101,44 +114,40 @@ export function parseDistanceMasterText(text: string, salespersonRoster: string[
       .replace(/\s+/g, " ")
       .trim();
 
-    const dp = segment.match(DISTANCE_PRODUCT_RE);
-    if (!dp) {
-      warnings.push(`ลูกค้า ${customerCode}: ไม่พบคอลัมน์ระยะทาง/สินค้า — ตรวจสอบไฟล์ master ต้นฉบับ`);
+    const sm = segment.match(rosterRe);
+    if (!sm) {
+      warnings.push(`ลูกค้า ${customerCode}: ไม่พบชื่อเซลล์ที่ตรงกับ roster ในไฟล์ master — ตรวจสอบด้วยมือ`);
       rows.push({ customerCode, customerName: nameGuess || customerCode, productCode: null, distanceKm: null, salesperson: null, tag: "" });
       pendingNameStart = segmentEnd;
       continue;
     }
-    const distanceKm = dp[1] === "-" ? null : parseFloat(dp[1]);
-    const productCode = dp[2];
-    const dpAbsoluteEnd = codeEnd + dp.index! + dp[0].length;
-    const afterDp = fullText.slice(dpAbsoluteEnd, segmentEnd);
+    const salesperson = sm[0];
+    const beforeSalesperson = segment.slice(0, sm.index!);
+    const distanceTokens = [...beforeSalesperson.matchAll(DISTANCE_TOKEN_RE)];
+    const lastDistanceToken = distanceTokens.length > 0 ? distanceTokens[distanceTokens.length - 1][1] : null;
+    if (!lastDistanceToken) {
+      warnings.push(`ลูกค้า ${customerCode}: ไม่พบคอลัมน์ระยะทาง — ตรวจสอบไฟล์ master ต้นฉบับ`);
+    }
+    const distanceKm = lastDistanceToken === null || lastDistanceToken === "-" ? null : parseFloat(lastDistanceToken);
 
-    const sm = afterDp.match(rosterRe);
-    let salesperson: string | null = null;
+    const afterSalespersonStart = codeEnd + sm.index! + sm[0].length;
+    const afterSalesperson = fullText.slice(afterSalespersonStart, segmentEnd);
     let tag: DistanceMasterRow["tag"] = "";
-    if (sm) {
-      salesperson = sm[0];
-      const afterSalespersonStart = dpAbsoluteEnd + sm.index! + sm[0].length;
-      const afterSalesperson = fullText.slice(afterSalespersonStart, segmentEnd);
-      // "1สาย1สู้" glued directly onto the salesperson name (no space) — its
-      // own vowels are subject to the same font-corruption risk as the SKIL
-      // check above, so match loosely by shape (digit + short Thai run,
-      // twice) rather than the literal string, and consume it here so it
-      // doesn't bleed into the next record's name guess.
-      const tagMatch = afterSalesperson.match(/^\d\s*[ก-๙](?:\s?[ก-๙]){0,3}\s*\d\s*[ก-๙](?:\s?[ก-๙]){0,3}/);
-      if (tagMatch) {
-        tag = "1สาย1สู้";
-        pendingNameStart = afterSalespersonStart + tagMatch[0].length;
-      } else {
-        pendingNameStart = afterSalespersonStart;
-      }
+    // "1สาย1สู้" glued directly onto the salesperson name (no space) — its
+    // own vowels are subject to the same font-corruption risk as the SKILL
+    // check above, so match loosely by shape (digit + short Thai run,
+    // twice) rather than the literal string, and consume it here so it
+    // doesn't bleed into the next record's name guess.
+    const tagMatch = afterSalesperson.match(/^\d\s*[ก-๙](?:\s?[ก-๙]){0,3}\s*\d\s*[ก-๙](?:\s?[ก-๙]){0,3}/);
+    if (tagMatch) {
+      tag = "1สาย1สู้";
+      pendingNameStart = afterSalespersonStart + tagMatch[0].length;
     } else {
-      warnings.push(`ลูกค้า ${customerCode}: ไม่พบชื่อเซลล์ที่ตรงกับ roster ในไฟล์ master — ตรวจสอบด้วยมือ`);
-      pendingNameStart = segmentEnd;
+      pendingNameStart = afterSalespersonStart;
     }
     if (distanceKm === null && !tag) tag = "ทางผ่าน";
 
-    rows.push({ customerCode, customerName: nameGuess || customerCode, productCode, distanceKm, salesperson, tag });
+    rows.push({ customerCode, customerName: nameGuess || customerCode, productCode: null, distanceKm, salesperson, tag });
   }
 
   if (rows.length === 0) {

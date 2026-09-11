@@ -29,6 +29,7 @@ export const samthongBranch: BranchConfig = {
   penaltyNegativeQEnabled: true,
 
   freightTiers: DEFAULT_FREIGHT_TIERS,
+  freightMissingBehavior: "defaultZero",
 
   salespersonRoster: ["จุ่น", "อุ้ย"],
 
@@ -64,8 +65,3 @@ export const samthongBranch: BranchConfig = {
   ],
 };
 
-export const BRANCHES = [samthongBranch];
-
-export function getBranchById(id: string) {
-  return BRANCHES.find((b) => b.id === id) ?? null;
-}

@@ -52,9 +52,20 @@ export interface MasterSheetRow {
   sourceText: string;
 }
 
+/** Per-sheet qty threshold + freight rule — one truck/department sheet is
+ *  always internally uniform (a whole file belongs to one truck or one
+ *  department), so this is resolved once per sheet rather than per row. */
+export interface SheetScope {
+  minQtyLiters: number;
+  requireExactMultiple: boolean;
+  qtyMultipleOf: number;
+  fixedFreightRate: number | null;
+}
+
 export interface BuildWorkbookInput {
   branch: BranchConfig;
   truckLabels: string[];
+  truckScopes: Map<string, SheetScope>;
   rows: ExportTransactionRow[];
   masterRows: MasterSheetRow[];
   debtDeductionTotal: number;
@@ -63,7 +74,13 @@ export interface BuildWorkbookInput {
   warnings: string[];
 }
 
-const PRODUCT_NAME_BY_CODE: Record<string, string> = { DS: "ดีเซล B7", G91: "แก๊สโซฮอล์ 91", G95: "แก๊สโซฮอล์ 95" };
+const PRODUCT_NAME_BY_CODE: Record<string, string> = {
+  DS: "ดีเซล B7",
+  DS2: "ดีเซล-2",
+  DSB20: "ดีเซลบี20",
+  G91: "แก๊สโซฮอล์ 91",
+  G95: "แก๊สโซฮอล์ 95",
+};
 
 function productLabel(code: string): string {
   return PRODUCT_NAME_BY_CODE[code] ?? code;
@@ -110,9 +127,25 @@ function safeSheetName(name: string, used: Set<string>): string {
   return candidate;
 }
 
-function freightFormula(r: number): string {
+const BLOCK_SENTINEL = "ต้องตรวจสอบระยะทาง(M)";
+
+/**
+ * scope.fixedFreightRate overrides the distance-table lookup entirely (e.g.
+ * กระนวน B3's fixed 0.10) — still a live formula so the 1สาย1สู้ tag keeps
+ * working. Otherwise, on a missing/out-of-range distance:
+ *  - "defaultZero" (สามทอง's approved template behavior): fall through to 0.
+ *  - "block" (กระนวน's confirmed v2 spec): surface the BLOCK_SENTINEL text
+ *    instead of guessing — IFERROR/text-propagation carries that sentinel
+ *    through N/O/P/Q automatically (any arithmetic on text errors out, and
+ *    every downstream cell here is already wrapped in IFERROR(...,"")).
+ */
+function freightFormula(r: number, scope: SheetScope, freightMissingBehavior: "defaultZero" | "block"): string {
+  if (scope.fixedFreightRate !== null) {
+    return `IF(H${r}="1สาย1สู้",0,${scope.fixedFreightRate})`;
+  }
+  const missingFallback = freightMissingBehavior === "block" ? `"${BLOCK_SENTINEL}"` : "0";
   return (
-    `IF(H${r}="1สาย1สู้",0,IF(G${r}="",0,IFERROR(_xlfn.IFS(` +
+    `IF(H${r}="1สาย1สู้",0,IF(G${r}="",${missingFallback},IFERROR(_xlfn.IFS(` +
     `AND(G${r}>=20,G${r}<=59),0.15,AND(G${r}>=60,G${r}<=69),0.17,` +
     `AND(G${r}>=70,G${r}<=79),0.19,AND(G${r}>=80,G${r}<=89),0.2,` +
     `AND(G${r}>=90,G${r}<=99),0.22,AND(G${r}>=100,G${r}<=109),0.24,` +
@@ -120,23 +153,27 @@ function freightFormula(r: number): string {
     `AND(G${r}>=140,G${r}<=159),0.32,AND(G${r}>=160,G${r}<=169),0.34,` +
     `AND(G${r}>=170,G${r}<=179),0.35,AND(G${r}>=180,G${r}<=189),0.36,` +
     `AND(G${r}>=190,G${r}<=199),0.38,AND(G${r}>=200,G${r}<=209),0.39` +
-    `),0)))`
+    `),${missingFallback})))`
   );
 }
 
-function commissionFormula(r: number, branch: BranchConfig): string {
+function commissionFormula(r: number, branch: BranchConfig, scope: SheetScope): string {
   const rosterCheck = branch.salespersonRoster.map((name) => `S${r}<>"${name}"`).join(",");
   const penalty = branch.penaltyNegativeQEnabled ? `-I${r}*${branch.ratePerLiter}` : "0";
   const tier = (label: string, threshold: number) =>
     `IF(R${r}="${label}",IF(Q${r}>=${threshold},I${r}*${branch.ratePerLiter},IF(Q${r}>=0,0,${penalty}))`;
+  const qtyGate = scope.requireExactMultiple
+    ? `OR(I${r}<${scope.minQtyLiters},MOD(I${r},${scope.qtyMultipleOf})<>0)`
+    : `I${r}<${scope.minQtyLiters}`;
   return (
+    `IF(M${r}="${BLOCK_SENTINEL}","${BLOCK_SENTINEL}",` +
     `IFERROR(IF(OR(I${r}="",R${r}=""),0,` +
-    `IF(OR(I${r}<${branch.minQtyLiters},MOD(I${r},${branch.qtyMultipleOf})<>0),0,` +
+    `IF(${qtyGate},0,` +
     `IF(AND(${rosterCheck}),0,` +
     `${tier("ขายสด", branch.thresholds.cash)},` +
     `${tier("ขายเชื่อ", branch.thresholds.credit)},` +
     `${tier("ลูกหนี้ค้างชำระ", branch.thresholds.overdue)},` +
-    `"ตรวจสอบประเภท(R)")))))),0)`
+    `"ตรวจสอบประเภท(R)")))))),0))`
   );
 }
 
@@ -183,16 +220,25 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     sheet.addRow(TRUCK_HEADER);
     sheet.getRow(1).font = { bold: true };
 
+    const scope = input.truckScopes.get(truckLabel) ?? {
+      minQtyLiters: branch.minQtyLiters ?? 0,
+      requireExactMultiple: branch.requireExactMultiple ?? false,
+      qtyMultipleOf: branch.qtyMultipleOf ?? 1000,
+      fixedFreightRate: null,
+    };
+
     const deptRows = input.rows.filter((r) => r.truckLabel === truckLabel);
     deptRows.forEach((r, idx) => {
       const excelRow = idx + 2;
       const noteParts = [...r.calc.flags];
+      if (r.calc.blockedReason) noteParts.push(r.calc.blockedReason);
       if (r.meterAnnotation) noteParts.push(`หมายเหตุจากไฟล์ขาย: "${r.meterAnnotation}" — ต้องยืนยันกับผู้ใช้ว่านับเป็นยอดเซลล์จริงหรือไม่`);
       if (r.outstandingAmount !== null) noteParts.push(`หักหนี้ค้างชำระ ฿${r.outstandingAmount.toLocaleString()} — พบในรายงานลูกหนี้ ณ ${branch.arAsOfLabel}`);
 
       const gVal = r.distanceKm ?? "";
       const hVal = r.masterTag || "";
       const sVal = r.salesperson ?? "ตรวจสอบเซลล์";
+      const mVal = r.calc.blocked ? BLOCK_SENTINEL : r.calc.freightRate!;
 
       sheet.addRow([
         idx + 1,
@@ -207,16 +253,17 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
         r.saleValue,
         r.cost,
         fv(`IFERROR(J${excelRow}-K${excelRow},"")`, r.calc.grossProfit),
-        fv(freightFormula(excelRow), r.calc.freightRate),
-        fv(`IFERROR(M${excelRow}*I${excelRow},"")`, r.calc.freightTotal),
-        fv(`IFERROR(N${excelRow}+K${excelRow},"")`, r.calc.totalCost),
-        fv(`IFERROR(J${excelRow}-O${excelRow},"")`, r.calc.profitAfterFreight),
-        fv(`IFERROR(P${excelRow}/I${excelRow},"")`, r.calc.profitPerLiter),
+        fv(freightFormula(excelRow, scope, branch.freightMissingBehavior), mVal),
+        fv(`IFERROR(M${excelRow}*I${excelRow},"")`, r.calc.freightTotal ?? ""),
+        fv(`IFERROR(N${excelRow}+K${excelRow},"")`, r.calc.totalCost ?? ""),
+        fv(`IFERROR(J${excelRow}-O${excelRow},"")`, r.calc.profitAfterFreight ?? ""),
+        fv(`IFERROR(P${excelRow}/I${excelRow},"")`, r.calc.profitPerLiter ?? ""),
         fv(`IF(LEFT(C${excelRow},1)="H","ขายสด",IF(LEFT(C${excelRow},1)="I","ขายเชื่อ","ตรวจสอบ"))`, saleTypeLabel(r.saleType)),
         fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,2,FALSE()),"ตรวจสอบเซลล์")`, sVal),
-        fv(commissionFormula(excelRow, branch), r.calc.commission),
+        fv(commissionFormula(excelRow, branch, scope), r.calc.commission),
         noteParts.join("; "),
       ]);
+      if (r.calc.blocked) sheet.getRow(excelRow).eachCell((c) => (c.fill = EXCLUDE_FILL));
     });
 
     const lastDataRow = deptRows.length + 1;
@@ -225,7 +272,9 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       const totalRow = lastDataRow + 2;
       const qualifyingRow = lastDataRow + 3;
       const qtyRange = `I2:I${lastDataRow}`;
-      const qualifyCond = `(${qtyRange}>=${branch.minQtyLiters})*(MOD(${qtyRange},${branch.qtyMultipleOf})=0)`;
+      const qualifyCond = scope.requireExactMultiple
+        ? `(${qtyRange}>=${scope.minQtyLiters})*(MOD(${qtyRange},${scope.qtyMultipleOf})=0)`
+        : `(${qtyRange}>=${scope.minQtyLiters})`;
       const totalQty = deptRows.reduce((s, r) => s + r.qty, 0);
       const totalComm = deptRows.reduce((s, r) => s + r.calc.commissionNumeric, 0);
       const qualifyingQty = deptRows.filter((r) => r.calc.qualifiesByQty).reduce((s, r) => s + r.qty, 0);
@@ -294,13 +343,10 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
 
   // ---------- ค่าคอมรวม ----------
   const summarySheet = workbook.addWorksheet(safeSheetName("ค่าคอมรวม", usedSheetNames));
-  summarySheet.addRow([
-    "เซลล์",
-    `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ >=${branch.minQtyLiters.toLocaleString()}L และลงท้ายพันพอดี ทุกชนิดน้ำมัน)`,
-    "ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)",
-    "หักค่าคอมจากหนี้ค้างชำระ",
-    "ค่าคอมสุทธิ",
-  ]);
+  const qtyColumnLabel = branch.departments
+    ? `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ตามเกณฑ์ปริมาณของแต่ละแผนก ทุกชนิดน้ำมัน — ${branch.departments.map((d) => `${d.label}≥${d.minQtyLiters.toLocaleString()}ล.`).join(", ")})`
+    : `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ >=${(branch.minQtyLiters ?? 0).toLocaleString()}L${branch.requireExactMultiple ? " และลงท้ายพันพอดี" : ""} ทุกชนิดน้ำมัน)`;
+  summarySheet.addRow(["เซลล์", qtyColumnLabel, "ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)", "หักค่าคอมจากหนี้ค้างชำระ", "ค่าคอมสุทธิ"]);
   summarySheet.getRow(1).font = { bold: true };
   const perSalesperson = branch.salespersonRoster.map((name) => {
     const rows = input.rows.filter((r) => r.salesperson === name);
@@ -315,7 +361,11 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     const qtyTerms = input.truckLabels.map((label) => {
       const s = truckSheetNameByLabel.get(label)!;
       const last = truckLastRow.get(label) ?? 1;
-      return `SUMPRODUCT(('${s}'!$S$2:$S$${last}=$A${r})*('${s}'!$I$2:$I$${last}>=${branch.minQtyLiters})*(MOD('${s}'!$I$2:$I$${last},${branch.qtyMultipleOf})=0)*'${s}'!$I$2:$I$${last})`;
+      const sc = input.truckScopes.get(label) ?? { minQtyLiters: branch.minQtyLiters ?? 0, requireExactMultiple: branch.requireExactMultiple ?? false, qtyMultipleOf: branch.qtyMultipleOf ?? 1000, fixedFreightRate: null };
+      const qtyCond = sc.requireExactMultiple
+        ? `('${s}'!$I$2:$I$${last}>=${sc.minQtyLiters})*(MOD('${s}'!$I$2:$I$${last},${sc.qtyMultipleOf})=0)`
+        : `('${s}'!$I$2:$I$${last}>=${sc.minQtyLiters})`;
+      return `SUMPRODUCT(('${s}'!$S$2:$S$${last}=$A${r})*${qtyCond}*'${s}'!$I$2:$I$${last})`;
     });
     const commTerms = input.truckLabels.map((label) => {
       const s = truckSheetNameByLabel.get(label)!;
@@ -351,9 +401,12 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   coverSheet.mergeCells(1, 1, 1, branch.teamSplit.roles.length + 2);
   coverSheet.getCell("A1").value = `สรุปค่าคอมมิชชั่นฝ่ายการตลาด สาขา${branch.label} - เดือน ${branch.periodLabel} (${branch.periodLabelThai})`;
   coverSheet.getRow(1).font = { bold: true, size: 13 };
+  const qtyRuleLabel = branch.departments
+    ? branch.departments.map((d) => `${d.label}>=${d.minQtyLiters.toLocaleString()}ล.`).join(", ")
+    : `>=${(branch.minQtyLiters ?? 0).toLocaleString()} ลิตร${branch.requireExactMultiple ? " และลงท้ายพันพอดี" : ""}`;
   coverSheet.mergeCells(3, 1, 3, branch.teamSplit.roles.length + 2);
   coverSheet.getCell("A3").value =
-    `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${branch.fuelProductCodes.map(productLabel).join("+")} ที่ >=${branch.minQtyLiters.toLocaleString()} ลิตร และลงท้ายพันพอดี | ไม่รวมลูกค้า${branch.excludedCustomers.map((e) => ` ${e.customerName}`).join(", ")} (ลูกค้ารถมิเตอร์)`;
+    `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${branch.fuelProductCodes.map(productLabel).join("+")} ที่ ${qtyRuleLabel} | ไม่รวมลูกค้า${branch.excludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
   coverSheet.getRow(3).font = { italic: true };
 
   const splitHeaderRow = 5;
@@ -432,9 +485,16 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
 
   addLine("2) เกณฑ์การกรองรายการที่เข้าเกณฑ์ค่าคอม");
   addLine(`- รวมน้ำมันใสทุกชนิด: ${branch.fuelProductCodes.map(productLabel).join(", ")}`);
-  addLine(
-    `- ปริมาณขายสุทธิต้อง >= ${branch.minQtyLiters.toLocaleString()} ลิตร ต่อ 1 เอกสาร${branch.requireExactMultiple ? ` 'และ' ต้องลงท้ายพันพอดี (หาร ${branch.qtyMultipleOf.toLocaleString()} ลงตัว) — เช่น 2,000/3,000/4,000 เข้าเกณฑ์ แต่ 2,500 ไม่เข้าเกณฑ์เลยทั้งบิล` : ""}`
-  );
+  if (branch.departments) {
+    addLine("- ปริมาณขายสุทธิต้อง >= เกณฑ์ขั้นต่ำของแต่ละแผนก ต่อ 1 เอกสาร (ไม่มีเงื่อนไขต้องลงท้ายพันพอดี):");
+    for (const d of branch.departments) {
+      addLine(`    ${d.label} (${d.code}): >= ${d.minQtyLiters.toLocaleString()} ลิตร${d.fixedFreightRate !== null ? ` · ค่าขนส่ง/ลิตร คงที่ ${d.fixedFreightRate} บาท` : ""}`);
+    }
+  } else {
+    addLine(
+      `- ปริมาณขายสุทธิต้อง >= ${(branch.minQtyLiters ?? 0).toLocaleString()} ลิตร ต่อ 1 เอกสาร${branch.requireExactMultiple ? ` 'และ' ต้องลงท้ายพันพอดี (หาร ${(branch.qtyMultipleOf ?? 0).toLocaleString()} ลงตัว) — เช่น 2,000/3,000/4,000 เข้าเกณฑ์ แต่ 2,500 ไม่เข้าเกณฑ์เลยทั้งบิล` : ""}`
+    );
+  }
   addLine("- ชีทรถแต่ละคันแสดงทุกแถวของทุกชนิดสินค้า (รวมแถวที่ไม่เข้าเกณฑ์ไว้เพื่อการตรวจสอบ) — คอลัมน์ 'ค่าคอม' เป็น 0 อัตโนมัติถ้าไม่เข้าเกณฑ์");
   addLine("- ไม่ได้ตรวจการรวมบิลย่อยที่ต่ำกว่าเกณฑ์ของลูกค้ารายเดียวกันในวันเดียวกัน หากพบควรให้ผู้ใช้ยืนยันก่อนรวมบิล");
   blank();
@@ -471,12 +531,23 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     );
   }
   addLine("- ลูกค้าที่มีแท็ก '1สาย1สู้' หรือ 'ทางผ่าน' (ระยะทางว่าง) ใช้ค่าขนส่ง/ลิตร = 0");
+  const missingBehaviorNote =
+    branch.freightMissingBehavior === "block"
+      ? "ค่าขนส่งจะขึ้น 'ต้องตรวจสอบระยะทาง(M)' แทนการเดา — ต้องกรอกระยะทางหรือยืนยันแท็กก่อนแถวนั้นจึงจะคำนวณค่าคอมได้"
+      : "ค่าขนส่งถูกตั้งเป็น 0 โดยดีฟอลต์ — ต้องยืนยันระยะทาง/เซลล์จริงก่อนส่งมอบ";
   const noMasterCodes = [...new Set(input.rows.filter((r) => r.calc.qualifiesByQty && !r.masterFound).map((r) => r.customerCode))];
   addLine(
     noMasterCodes.length === 0
       ? "- ทุกลูกค้าที่เข้าเกณฑ์รอบนี้มีข้อมูล master ครบแล้ว"
-      : `- ⚠ ลูกค้าที่เข้าเกณฑ์แต่ไม่พบในไฟล์ master เลยรอบนี้ (ค่าขนส่งถูกตั้งเป็น 0 โดยดีฟอลต์ — ต้องยืนยันระยะทาง/เซลล์จริงก่อนส่งมอบ): ${noMasterCodes.join(", ")}`
+      : `- ⚠ ลูกค้าที่เข้าเกณฑ์แต่ไม่พบในไฟล์ master เลยรอบนี้ (${missingBehaviorNote}): ${noMasterCodes.join(", ")}`
   );
+  const blockedRows = input.rows.filter((r) => r.calc.blocked);
+  if (blockedRows.length > 0) {
+    addLine(
+      `- ⚠ ${blockedRows.length} แถวถูก BLOCK (ไม่คำนวณค่าคอม จนกว่าจะแก้ไข) เพราะไม่มีระยะทางหรือระยะทางเกิน 209 กม.: ` +
+        blockedRows.map((r) => `${r.customerCode} เอกสาร ${r.docNo}`).join(", ")
+    );
+  }
   blank();
 
   addLine("6) การหักค่าคอมจากหนี้ที่ยังเก็บไม่ได้");
