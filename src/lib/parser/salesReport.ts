@@ -44,7 +44,19 @@ const SKIP_LINE_MARKERS = [
 ];
 const NORMALIZED_SKIP_LINE_MARKERS = SKIP_LINE_MARKERS.map(normalizeThai);
 
-const COMPANY_LINE_RE = /^ห[จๆ]ก\.|บริษัท|ห้างหุ้นส่วน|หางหุนสวน/;
+// Anchored to the START of the line — this is meant to catch the report's
+// own letterhead line (e.g. "หจก.สามทองบริการ" printed on every page), which
+// never carries a trailing "/<code>". A customer whose own name happens to
+// start with "บริษัท"/"ห้างหุ้นส่วน" (a very common Thai company-name prefix —
+// real example: "บริษัทสหเมืองท่า ดีเวลลอปเม้นต์ จำกัด /ST51165") would
+// otherwise get silently skipped by this same pattern, which doesn't drop
+// its transaction rows (their customerCode column doesn't depend on this
+// header) but does leave currentCustomerNameRaw stuck on the PREVIOUS
+// customer's name for every row until the next real header — found by
+// tracing why ST51165's debt-sheet rows showed ST51163's name. The
+// CODE_SUFFIX_RE check below excludes that case: a real customer header
+// always ends in "/<code>", the letterhead line never does.
+const COMPANY_LINE_RE = /^(ห[จๆ]ก\.|บริษัท|ห้างหุ้นส่วน|หางหุนสวน)/;
 
 function isNumericToken(token: string): boolean {
   return /^-?[\d,]+(\.\d+)?$/.test(token);
@@ -122,7 +134,7 @@ export function parseSalesReportText(text: string): ParsedSalesReport {
 
     const trimmedForSkipCheck = normalizeThai(trimmed);
     if (NORMALIZED_SKIP_LINE_MARKERS.some((m) => trimmedForSkipCheck.includes(m))) continue;
-    if (COMPANY_LINE_RE.test(trimmed)) continue;
+    if (COMPANY_LINE_RE.test(trimmed) && !CODE_SUFFIX_RE.test(trimmed)) continue;
 
     if (trimmed.startsWith("รวมทั้งสิ้น")) {
       const { qty, value } = extractQtyAndValue(trimmed);
