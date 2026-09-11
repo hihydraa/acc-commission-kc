@@ -2,6 +2,7 @@ import { extractPdfText } from "./parser/pdfExtract";
 import { parseSalesReportText } from "./parser/salesReport";
 import { parseArReportText } from "./parser/arReport";
 import { parseDistanceMasterText } from "./parser/distanceMaster";
+import { ocrCustomerNamesFromMasterPdf } from "./parser/ocrNames";
 import { calculateTransaction, type SaleType, type TransactionCalcResult } from "./calc/commissionEngine";
 import type { BranchConfig } from "@/branches/types";
 import { buildCommissionWorkbook, type ExportTransactionRow, type MasterSheetRow } from "./excelExport";
@@ -117,11 +118,25 @@ export async function runCommissionPipeline(
 
   // ---------- parse master (distance + เซลล์) ----------
   let masterFileRows: Awaited<ReturnType<typeof parseDistanceMasterText>>["rows"] = [];
+  // The master PDF's own embedded text layer is missing Thai tone
+  // marks/vowels for customer names (a defect in the source file's font
+  // encoding, not in how it's parsed — verified by rendering the page and
+  // comparing against the visually-correct glyphs). OCR-ing that render
+  // recovers the real name; scoped to just this one small, single-page file
+  // — doing the same for every multi-hundred-row sales report would be far
+  // too slow for a request/response API and far riskier (a misread digit in
+  // a quantity directly corrupts the commission math, unlike a misread
+  // letter in a display-only name).
+  let ocrNamesByCode = new Map<string, string>();
   if (masterFile) {
     const masterText = await extractPdfText(masterFile.buffer);
     const parsedMaster = parseDistanceMasterText(masterText, branch.salespersonRoster);
     warnings.push(...parsedMaster.warnings.map((w) => `[master] ${w}`));
     masterFileRows = parsedMaster.rows;
+
+    const ocrResult = await ocrCustomerNamesFromMasterPdf(masterFile.buffer);
+    warnings.push(...ocrResult.warnings);
+    ocrNamesByCode = ocrResult.namesByCode;
   } else {
     warnings.push("[master] ไม่ได้แนบไฟล์ master ระยะทาง/เซลล์ — จะใช้เฉพาะข้อมูลที่ยืนยันไว้ล่วงหน้าใน config สาขา (masterOverrides) เท่านั้น");
   }
@@ -286,9 +301,24 @@ export async function runCommissionPipeline(
   }
 
   const excludedCodes = new Set(branch.excludedCustomers.map((ex) => ex.customerCode));
+  const overrideCodes = new Set(branch.masterOverrides.map((ov) => ov.customerCode));
   const masterRows: MasterSheetRow[] = [...masterByCode.entries()].map(([customerCode, e]) => ({
     customerCode,
-    customerName: excludedCodes.has(customerCode) ? e.customerName : customerNameByCode.get(customerCode) || e.customerName || customerCode,
+    // Priority for the Master sheet's display name:
+    //  - excluded customers keep their crafted exclusion label as-is.
+    //  - masterOverrides customers keep the name typed directly into the
+    //    branch config — that's already a manually-verified correct name
+    //    (see samthong.ts), so it must win over the sales-report-derived
+    //    name, which has the exact same font-encoding defect as the master
+    //    file (just not OCR-corrected, since OCR only runs against the
+    //    master PDF — see ocrNames.ts).
+    //  - everyone else (master-file-sourced) prefers the OCR'd name (most
+    //    reliable for Thai tone marks/vowels) over the sales-report name,
+    //    over the raw uncorrected master-file text, over the bare code.
+    customerName:
+      excludedCodes.has(customerCode) || overrideCodes.has(customerCode)
+        ? e.customerName
+        : ocrNamesByCode.get(customerCode) || customerNameByCode.get(customerCode) || e.customerName || customerCode,
     salesperson: e.salesperson,
     distanceKm: e.distanceKm,
     tag: e.tag,
