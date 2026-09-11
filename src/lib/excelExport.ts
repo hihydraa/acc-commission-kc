@@ -68,7 +68,6 @@ export interface BuildWorkbookInput {
   truckScopes: Map<string, SheetScope>;
   rows: ExportTransactionRow[];
   masterRows: MasterSheetRow[];
-  debtDeductionTotal: number;
   debtQtyTotal: number;
   standingNotes: string[];
   warnings: string[];
@@ -296,9 +295,21 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   // ---------- หักหนี้ค้างชำระ ----------
   const debtSheet = workbook.addWorksheet(safeSheetName("หักหนี้ค้างชำระ", usedSheetNames));
   debtSheet.mergeCells(1, 1, 1, 8);
-  debtSheet.getCell("A1").value = `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} (ทุกชนิดน้ำมันที่เข้าเกณฑ์)`;
+  debtSheet.getCell("A1").value =
+    branch.debtDeductionMode === "auto"
+      ? `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} (ทุกชนิดน้ำมันที่เข้าเกณฑ์)`
+      : `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} — รายการนี้เป็น "การแจ้งเตือน" เท่านั้น ยังไม่ได้หักออกจากค่าคอมสุทธิ (ดูชีทค่าคอมรวม คอลัมน์ "หนี้ค้างที่ต้องพิจารณา" ที่ตั้งต้น 0) บัญชีต้องพิจารณาหักเอง 50%/100% ตาม policy ข้อ 6-7`;
   debtSheet.getRow(1).font = { bold: true };
-  debtSheet.addRow(["รหัสลูกค้า", "ชื่อลูกค้า", "เอกสาร#", "วันที่", "ลิตรที่ต้องนำมาหักค่าคอม", "เซลล์", "ค่าคอมของรายการนี้ (บาท)", `ยอดคงค้าง (บาท) ตามรายงานลูกหนี้ ${branch.arAsOfLabel}`]);
+  debtSheet.addRow([
+    "รหัสลูกค้า",
+    "ชื่อลูกค้า",
+    "เอกสาร#",
+    "วันที่",
+    "ลิตรที่เกี่ยวข้อง",
+    "เซลล์",
+    branch.debtDeductionMode === "auto" ? "ค่าคอมของรายการนี้ (บาท)" : "ค่าคอมของรายการนี้ (บาท) — อ้างอิงเท่านั้น",
+    `ยอดคงค้าง (บาท) ตามรายงานลูกหนี้ ${branch.arAsOfLabel}`,
+  ]);
   debtSheet.getRow(2).font = { bold: true };
   const debtRows = input.rows.filter((r) => (r.outstandingAmount ?? 0) > 0);
   for (const r of debtRows) {
@@ -315,25 +326,31 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     ]);
   }
   const debtDataLast = debtRows.length + 2;
+  const debtInformationalTotal = debtRows.reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
   if (debtRows.length > 0) {
     debtSheet.addRow([]);
-    debtSheet.getCell(`A${debtDataLast + 2}`).value = "รวมลิตรที่ต้องหัก";
+    debtSheet.getCell(`A${debtDataLast + 2}`).value = branch.debtDeductionMode === "auto" ? "รวมลิตรที่ต้องหัก" : "รวมลิตรที่เกี่ยวข้อง";
     debtSheet.getCell(`B${debtDataLast + 2}`).value = fv(`SUM(E3:E${debtDataLast})`, input.debtQtyTotal);
-    debtSheet.getCell(`A${debtDataLast + 3}`).value = "รวมค่าคอมที่ต้องหัก";
-    debtSheet.getCell(`B${debtDataLast + 3}`).value = fv(`SUM(G3:G${debtDataLast})`, input.debtDeductionTotal);
+    debtSheet.getCell(`A${debtDataLast + 3}`).value = branch.debtDeductionMode === "auto" ? "รวมค่าคอมที่ต้องหัก" : "รวมค่าคอมของรายการที่ต้องพิจารณา (อ้างอิงเท่านั้น — ยังไม่ได้หัก)";
+    debtSheet.getCell(`B${debtDataLast + 3}`).value = fv(`SUM(G3:G${debtDataLast})`, debtInformationalTotal);
     debtSheet.getRow(debtDataLast + 2).font = { bold: true };
     debtSheet.getRow(debtDataLast + 3).font = { bold: true };
     const noteStart = debtDataLast + 5;
     debtSheet.getCell(`A${noteStart}`).value = "หมายเหตุ:";
     debtSheet.getCell(`A${noteStart + 1}`).value =
-      `- วิธีหัก: จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} กับเอกสารที่ยังคงค้างในรายงานลูกหนี้คงค้างแบบละเอียด ณ วันที่ ${branch.arAsOfLabel}`;
+      `- วิธีจับคู่: เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} กับเอกสารที่ยังคงค้างในรายงานลูกหนี้คงค้างแบบละเอียด ณ วันที่ ${branch.arAsOfLabel}`;
     debtSheet.getCell(`A${noteStart + 2}`).value = `- พบ ${debtRows.length} รายการที่ตรงกัน:`;
     debtRows.forEach((r, i) => {
       debtSheet.getCell(`A${noteStart + 3 + i}`).value =
         `    ${i + 1}) ${r.customerCode} ${r.customerName} เอกสาร ${r.docNo} (${productLabel(r.productCode)} ${r.qty.toLocaleString()} ลิตร) ยอดคงค้าง ${(r.arOutstandingReference ?? 0).toLocaleString()} บาท`;
     });
-    debtSheet.getCell(`A${noteStart + 3 + debtRows.length}`).value =
-      "- ค่าคอมของแต่ละรายการคำนวณจากสูตรเดียวกับชีทรถ (ตามลิตรจริงของรายการนั้น) ไม่ได้หักเป็นยอดเงินคงค้างตรงๆ";
+    if (branch.debtDeductionMode === "auto") {
+      debtSheet.getCell(`A${noteStart + 3 + debtRows.length}`).value =
+        "- ค่าคอมของแต่ละรายการคำนวณจากสูตรเดียวกับชีทรถ (ตามลิตรจริงของรายการนั้น) ไม่ได้หักเป็นยอดเงินคงค้างตรงๆ — ยอดนี้ถูกหักออกจากค่าคอมสุทธิของเซลล์แล้ว (ดูชีทค่าคอมรวม)";
+    } else {
+      debtSheet.getCell(`A${noteStart + 3 + debtRows.length}`).value =
+        "- รายการข้างต้นเป็นการแจ้งเตือนเท่านั้น — ยังไม่ได้หักออกจากค่าคอมสุทธิ (ชีทค่าคอมรวมตั้งค่าคอลัมน์นี้ไว้ที่ 0) บัญชีต้องพิจารณาหักเอง 50% ถ้ายังไม่จ่าย หรือ 100% ถ้าตกลงผ่อนตามตารางที่กำหนด ตาม policy ข้อ 6-7 แล้วกรอกยอดหักเข้าชีทค่าคอมรวมด้วยมือ";
+    }
   } else {
     debtSheet.addRow(["ไม่พบรายการค้างชำระที่ตรงกับรายการเข้าเกณฑ์เดือนนี้"]);
   }
@@ -346,14 +363,26 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   const qtyColumnLabel = branch.departments
     ? `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ตามเกณฑ์ปริมาณของแต่ละแผนก ทุกชนิดน้ำมัน — ${branch.departments.map((d) => `${d.label}≥${d.minQtyLiters.toLocaleString()}ล.`).join(", ")})`
     : `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ >=${(branch.minQtyLiters ?? 0).toLocaleString()}L${branch.requireExactMultiple ? " และลงท้ายพันพอดี" : ""} ทุกชนิดน้ำมัน)`;
-  summarySheet.addRow(["เซลล์", qtyColumnLabel, "ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)", "หักค่าคอมจากหนี้ค้างชำระ", "ค่าคอมสุทธิ"]);
+  const debtColumnLabel =
+    branch.debtDeductionMode === "auto"
+      ? "หักค่าคอมจากหนี้ค้างชำระ"
+      : "หนี้ค้างที่ต้องพิจารณา (บาท) — บัญชีปรับเอง ตั้งต้น 0";
+  summarySheet.addRow(["เซลล์", qtyColumnLabel, "ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)", debtColumnLabel, "ค่าคอมสุทธิ"]);
   summarySheet.getRow(1).font = { bold: true };
   const perSalesperson = branch.salespersonRoster.map((name) => {
     const rows = input.rows.filter((r) => r.salesperson === name);
     const liters = rows.filter((r) => r.calc.qualifiesByQty).reduce((s, r) => s + r.qty, 0);
     const gross = rows.reduce((s, r) => s + r.calc.commissionNumeric, 0);
-    const debt = debtRows.filter((r) => r.salesperson === name).reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
-    return { name, liters, gross, debt, net: gross - debt };
+    const flaggedDebt = debtRows.filter((r) => r.salesperson === name).reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
+    // "auto" (สามทอง): matched debt is actually netted out of ค่าคอมสุทธิ.
+    // "flagOnly" (กระนวน): the full amount is only LISTED for accounting's
+    // own manual 50%/100% review (policy §6-7) — the applied deduction that
+    // feeds into ค่าคอมสุทธิ stays 0, matching the branch's own approved
+    // reference workbook exactly (its ค่าคอมรวม sheet's debt column is a
+    // literal 0, not a formula, precisely so accounting can safely
+    // overwrite it by hand without a live formula clobbering their edit).
+    const debt = branch.debtDeductionMode === "auto" ? flaggedDebt : 0;
+    return { name, liters, gross, debt, flaggedDebt, net: gross - debt };
   });
   branch.salespersonRoster.forEach((name, i) => {
     const r = i + 2;
@@ -372,13 +401,11 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       const last = truckLastRow.get(label) ?? 1;
       return `SUMIF('${s}'!$S$2:$S$${last},$A${r},'${s}'!$T$2:$T$${last})`;
     });
-    summarySheet.addRow([
-      name,
-      fv(qtyTerms.join("+"), agg.liters),
-      fv(commTerms.join("+"), agg.gross),
-      fv(`SUMIF(หักหนี้ค้างชำระ!$F:$F,$A${r},หักหนี้ค้างชำระ!$G:$G)`, agg.debt),
-      fv(`C${r}-D${r}`, agg.net),
-    ]);
+    const debtCell =
+      branch.debtDeductionMode === "auto"
+        ? fv(`SUMIF(หักหนี้ค้างชำระ!$F:$F,$A${r},หักหนี้ค้างชำระ!$G:$G)`, agg.debt)
+        : 0; // literal, not a formula — see comment on `perSalesperson` above
+    summarySheet.addRow([name, fv(qtyTerms.join("+"), agg.liters), fv(commTerms.join("+"), agg.gross), debtCell, fv(`C${r}-D${r}`, agg.net)]);
   });
   const grandRow = branch.salespersonRoster.length + 2;
   summarySheet.getRow(grandRow).getCell(1).value = "รวมทั้งหมด";
@@ -550,12 +577,18 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   }
   blank();
 
-  addLine("6) การหักค่าคอมจากหนี้ที่ยังเก็บไม่ได้");
-  addLine(
-    input.debtQtyTotal > 0
-      ? `- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — พบรายการตรงกัน รวม ฿${input.debtDeductionTotal.toLocaleString()} (ดูชีท 'หักหนี้ค้างชำระ') หักค่าคอมเฉพาะรายการนั้นตามลิตรจริง`
-      : `- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — ไม่พบรายการที่ตรงกันในรอบนี้`
-  );
+  addLine(branch.debtDeductionMode === "auto" ? "6) การหักค่าคอมจากหนี้ที่ยังเก็บไม่ได้" : "6) หนี้ค้างที่ต้องพิจารณา (ยังไม่ได้หักอัตโนมัติ)");
+  if (input.debtQtyTotal === 0) {
+    addLine(`- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — ไม่พบรายการที่ตรงกันในรอบนี้`);
+  } else if (branch.debtDeductionMode === "auto") {
+    addLine(
+      `- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — พบรายการตรงกัน รวม ฿${debtInformationalTotal.toLocaleString()} (ดูชีท 'หักหนี้ค้างชำระ') หักค่าคอมเฉพาะรายการนั้นตามลิตรจริง`
+    );
+  } else {
+    addLine(
+      `- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — พบรายการตรงกัน รวม ฿${debtInformationalTotal.toLocaleString()} (ดูชีท 'หักหนี้ค้างชำระ') แต่ตาม policy ข้อ 6-7 การหัก 50%/100% เป็นดุลยพินิจของบัญชี ไม่ใช่สูตรอัตโนมัติ — ยอดนี้ **ยังไม่ได้หัก** ออกจากค่าคอมสุทธิ (คอลัมน์ 'หนี้ค้างที่ต้องพิจารณา' ในชีทค่าคอมรวมตั้งไว้ที่ 0 ให้บัญชีกรอกเองหลังพิจารณา)`
+    );
+  }
   blank();
 
   addLine("7) บรรทัดสรุปในแต่ละชีทรถ");

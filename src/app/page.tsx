@@ -11,6 +11,7 @@ interface CalcSummary {
   grossCommission: number;
   debtDeduction: number;
   netCommission: number;
+  matchedDebtFlagged: number;
 }
 
 interface CalcResponse {
@@ -196,6 +197,13 @@ export default function Home() {
                 <dd className="font-medium">฿{baht(result.summary.netCommission)}</dd>
               </div>
             </dl>
+
+            {result.summary.debtDeduction === 0 && result.summary.matchedDebtFlagged > 0 && (
+              <div className="rounded border border-amber-300 bg-amber-50 p-3 text-xs text-amber-900">
+                พบหนี้ค้างชำระที่ตรงกับรายการเข้าเกณฑ์ ฿{baht(result.summary.matchedDebtFlagged)} — สาขานี้ไม่ได้หักอัตโนมัติ
+                (นโยบายให้บัญชีพิจารณาหัก 50%/100% เอง) ดูรายละเอียดในชีท &quot;หักหนี้ค้างชำระ&quot; ของไฟล์ Excel
+              </div>
+            )}
 
             <button onClick={downloadFile} className="w-full rounded bg-emerald-700 px-4 py-2 text-sm font-medium text-white">
               ดาวน์โหลดไฟล์ Excel ({result.filename})

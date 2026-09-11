@@ -96,6 +96,18 @@ export interface BranchConfig {
   penaltyNegativeQEnabled: boolean;
 
   freightTiers: FreightTier[];
+  /** How a matched outstanding-debt bill affects a เซลล์'s ค่าคอมสุทธิ.
+   *  "auto" (สามทอง's approved template + ST_8.69 reference, confirmed
+   *  nonzero ฿180 deduction that month) subtracts the matched bill's full
+   *  commission automatically. "flagOnly" (กระนวน's own approved reference
+   *  workbook, its หมายเหตุ sheet item 5: "คำนวณเต็มจำนวนไปก่อนแล้วทำ
+   *  เครื่องหมายเตือนบัญชี... ตั้งค่าเริ่มต้น = 0") computes and lists the
+   *  matched bills for visibility only — the deduction actually applied
+   *  stays 0, because that branch's policy items 6-7 (cut to 50% if still
+   *  unpaid past credit term, full 100% if the customer commits to a
+   *  payment schedule) is accounting's own manual judgment call, not a
+   *  formula. Never assume one branch's mode for the other. */
+  debtDeductionMode: "auto" | "flagOnly";
   /** what M (ค่าขนส่ง/ลิตร) should do when a qualifying row's distance is
    *  missing from Master or falls outside freightTiers, and no fixed rate
    *  applies. "defaultZero" (สามทอง's approved template behavior) computes

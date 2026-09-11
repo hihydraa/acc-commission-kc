@@ -30,6 +30,7 @@ export const samthongBranch: BranchConfig = {
 
   freightTiers: DEFAULT_FREIGHT_TIERS,
   freightMissingBehavior: "defaultZero",
+  debtDeductionMode: "auto",
 
   salespersonRoster: ["จุ่น", "อุ้ย"],
 

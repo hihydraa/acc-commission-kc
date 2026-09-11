@@ -24,8 +24,15 @@ export interface PipelineResult {
     qualifyingCustomerCount: number;
     qualifyingLiters: number;
     grossCommission: number;
+    /** the amount actually netted out of netCommission — 0 for a
+     *  "flagOnly" branch even when matchedDebtFlagged is nonzero */
     debtDeduction: number;
     netCommission: number;
+    /** the full amount of matched outstanding-debt bills found, regardless
+     *  of whether debtDeductionMode actually applies it — surfaced so a
+     *  "flagOnly" branch's UI can still show accounting that review is
+     *  needed even though debtDeduction/netCommission above show 0 */
+    matchedDebtFlagged: number;
   };
 }
 
@@ -318,7 +325,17 @@ export async function runCommissionPipeline(
   // SKILL §4: only rows that themselves qualify with a POSITIVE computed
   // commission are candidates — never the AR balance itself, never a
   // sibling invoice that isn't itself matched.
-  let debtDeductionTotal = 0;
+  //
+  // matchedDebtTotal is the full amount FOUND (always computed, always
+  // shown in the "หักหนี้ค้างชำระ" sheet for visibility) — whether it is
+  // actually netted out of ค่าคอมสุทธิ depends on branch.debtDeductionMode:
+  // "auto" (สามทอง, confirmed against its own approved ฿180 reference
+  // figure) subtracts it for real; "flagOnly" (กระนวน, confirmed in its own
+  // approved reference workbook's หมายเหตุ item 5 — "คำนวณเต็มจำนวนไปก่อน
+  // แล้วทำเครื่องหมายเตือนบัญชี... ตั้งค่าเริ่มต้น = 0") lists it for
+  // accounting's own manual 50%/100% policy judgment (§6-7) and leaves the
+  // applied deduction at 0. Never assume one branch's mode for the other.
+  let matchedDebtTotal = 0;
   const debtMatches: ExportTransactionRow[] = [];
   for (const row of exportRows) {
     if (row.calc.commissionNumeric <= 0) continue;
@@ -326,12 +343,17 @@ export async function runCommissionPipeline(
     if (!matches || matches.length === 0) continue;
     row.outstandingAmount = row.calc.commissionNumeric;
     row.arOutstandingReference = matches.reduce((s, m) => s + m.outstanding, 0);
-    debtDeductionTotal += row.outstandingAmount;
+    matchedDebtTotal += row.outstandingAmount;
     debtMatches.push(row);
   }
   if (debtMatches.length === 0) {
     warnings.push("[หักหนี้] ไม่พบรายการที่ต้องหักหนี้ค้างชำระในรอบนี้");
+  } else if (branch.debtDeductionMode === "flagOnly") {
+    warnings.push(
+      `[หักหนี้] พบ ${debtMatches.length} รายการค้างชำระ รวม ฿${matchedDebtTotal.toLocaleString()} — แจ้งเตือนเท่านั้น ยังไม่ได้หักออกจากค่าคอมสุทธิ บัญชีต้องพิจารณาหักเอง 50%/100% ตาม policy ข้อ 6-7 แล้วกรอกยอดหักด้วยมือในชีทค่าคอมรวม`
+    );
   }
+  const appliedDebtDeductionTotal = branch.debtDeductionMode === "auto" ? matchedDebtTotal : 0;
 
   // ---------- summary ----------
   // The SKILL uses two different scopes side by side in its own reference
@@ -390,7 +412,6 @@ export async function runCommissionPipeline(
     truckScopes,
     rows: exportRows,
     masterRows,
-    debtDeductionTotal,
     debtQtyTotal: debtMatches.reduce((s, r) => s + r.qty, 0),
     standingNotes: branch.standingNotes,
     warnings,
@@ -406,8 +427,9 @@ export async function runCommissionPipeline(
       qualifyingCustomerCount: new Set(qtyQualifyingRows.map((r) => r.customerCode)).size,
       qualifyingLiters: earningRows.reduce((s, r) => s + r.qty, 0),
       grossCommission,
-      debtDeduction: debtDeductionTotal,
-      netCommission: grossCommission - debtDeductionTotal,
+      debtDeduction: appliedDebtDeductionTotal,
+      netCommission: grossCommission - appliedDebtDeductionTotal,
+      matchedDebtFlagged: matchedDebtTotal,
     },
   };
 }
