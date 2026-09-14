@@ -48,7 +48,14 @@ import { PDFDocument } from "pdf-lib";
  * customer, and a code already resolved (anywhere) is never requested again.
  */
 
-const MODEL = "claude-haiku-4-5-20251001";
+// TEMP DIAGNOSTIC: was claude-haiku-4-5-20251001. Haiku's answers matched
+// this report's own corrupted text layer exactly on a real production run
+// (e.g. "ปม นิมิตรบริการ" — missing marks — instead of the visually-correct
+// "ปั๊ม นิมิตรบริการ"), suggesting it read the embedded text instead of
+// actually looking at the rendered page. Testing whether a stronger model
+// looks harder rather than taking that shortcut before deciding if the
+// extra cost is worth it.
+const MODEL = "claude-sonnet-5";
 const PAGES_PER_REQUEST = 6;
 const REQUEST_CONCURRENCY = 3;
 // Overall wall-clock budget for every Claude call in one pipeline run —
