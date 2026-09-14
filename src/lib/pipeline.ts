@@ -3,7 +3,7 @@ import { extractPdfText } from "./parser/pdfExtract";
 import { parseSalesReportText } from "./parser/salesReport";
 import { parseArReportText } from "./parser/arReport";
 import { parseDistanceMasterText } from "./parser/distanceMaster";
-import { resolveCustomerNamesViaClaude } from "./parser/claudeNames";
+import { ocrCustomerNamesFromMasterPdf } from "./parser/ocrNames";
 import { calculateTransaction, type SaleType, type TransactionCalcResult } from "./calc/commissionEngine";
 import type { BranchConfig, DepartmentConfig } from "@/branches/types";
 import { buildCommissionWorkbook, type ExportTransactionRow, type MasterSheetRow, type SheetScope } from "./excelExport";
@@ -121,11 +121,33 @@ export async function runCommissionPipeline(
 
   // ---------- parse master (distance + เซลล์) ----------
   let masterFileRows: Awaited<ReturnType<typeof parseDistanceMasterText>>["rows"] = [];
+  // The master PDF's own embedded text layer is missing Thai tone
+  // marks/vowels for customer names (a defect in the source file's font
+  // encoding, not in how it's parsed — verified by rendering the page and
+  // comparing against the visually-correct glyphs). OCR-ing that render
+  // recovers the real name; scoped to just this one small, single-page file.
+  //
+  // A Claude-vision-based approach (send the rendered page/PDF to Claude
+  // instead of a local OCR model) was tried for BOTH this file and every
+  // sales-report file, across 5 different designs — full pages, per-name
+  // pixel crops, native PDF documents, different batch sizes, a stronger
+  // model. All were rejected after real production runs: verified against
+  // a full branch's actual Master sheet, only 4 of 36 names came back
+  // correct, with several wildly wrong ("ไร่แสงตะวัน" -> "โรงสถะวัน") — worse
+  // than this restored Tesseract pass, which was already independently
+  // verified reliable before that work started. Sales-report names are left
+  // uncorrected (their own raw, if imperfect, text) rather than risk the
+  // same failure mode there too.
+  let ocrNamesByCode = new Map<string, string>();
   if (masterFile) {
     const masterText = await extractPdfText(masterFile.buffer);
     const parsedMaster = parseDistanceMasterText(masterText, branch.salespersonRoster);
     warnings.push(...parsedMaster.warnings.map((w) => `[master] ${w}`));
     masterFileRows = parsedMaster.rows;
+
+    const ocrResult = await ocrCustomerNamesFromMasterPdf(masterFile.buffer);
+    warnings.push(...ocrResult.warnings);
+    ocrNamesByCode = ocrResult.namesByCode;
   } else {
     warnings.push("[master] ไม่ได้แนบไฟล์ master ระยะทาง/เซลล์ — จะใช้เฉพาะข้อมูลที่ยืนยันไว้ล่วงหน้าใน config สาขา (masterOverrides) เท่านั้น");
   }
@@ -357,26 +379,6 @@ export async function runCommissionPipeline(
     }
   }
 
-  // ---------- correct Thai customer names via Claude vision ----------
-  // Every customer code that will actually be shown somewhere in the output:
-  // every sales-report row (every truck sheet lists every line, not just
-  // qualifying ones — see excelExport.ts) plus every master-file row (a
-  // customer with no sales this month can still appear on the Master
-  // sheet). Resolving anything outside this set would just burn API budget
-  // on names nobody ever sees.
-  const targetCodes = new Set<string>([...customerNameByCode.keys(), ...masterFileRows.map((r) => r.customerCode)]);
-  const nameResult = await resolveCustomerNamesViaClaude({
-    masterFile: masterFile?.buffer ?? null,
-    salesFiles: salesFiles.map((f) => ({ filename: f.filename, buffer: f.buffer })),
-    targetCodes,
-  });
-  warnings.push(...nameResult.warnings);
-  const namesByCode = nameResult.namesByCode;
-  for (const row of exportRows) {
-    const corrected = namesByCode.get(row.customerCode);
-    if (corrected) row.customerName = corrected;
-  }
-
   // ---------- debt-deduction match ----------
   // SKILL §4: only rows that themselves qualify with a POSITIVE computed
   // commission are candidates — never the AR balance itself, never a
@@ -465,14 +467,13 @@ export async function runCommissionPipeline(
     //  - masterOverrides customers keep the name typed directly into the
     //    branch config — that's already a manually-verified correct name
     //    (see samthong.ts), so it must win over anything derived from a PDF.
-    //  - everyone else prefers Claude's corrected name (see claudeNames.ts;
-    //    reads the rendered page the way a person would, unlike the source
-    //    PDF's own corrupted embedded text) over the raw sales-report name,
+    //  - everyone else (master-file-sourced) prefers the OCR'd name (most
+    //    reliable for Thai tone marks/vowels) over the sales-report name,
     //    over the raw uncorrected master-file text, over the bare code.
     customerName:
       excludedCodes.has(customerCode) || overrideCodes.has(customerCode)
         ? e.customerName
-        : namesByCode.get(customerCode) || customerNameByCode.get(customerCode) || e.customerName || customerCode,
+        : ocrNamesByCode.get(customerCode) || customerNameByCode.get(customerCode) || e.customerName || customerCode,
     salesperson: e.salesperson,
     distanceKm: e.distanceKm,
     tag: e.tag,
