@@ -179,25 +179,32 @@ export async function runCommissionPipeline(
     const text = await extractPdfText(file.buffer);
     const parsed = parseSalesReportText(text);
 
-    // Branches with `departments` (e.g. กระนวน) are classified by the sales
-    // file's own "เลือกแผนก" header value (already extracted by the parser as
-    // `truckCode`) rather than by filename — a department's qty threshold
-    // and freight rule genuinely differ from another's (§2.1), so guessing
-    // wrong here would silently apply the wrong money rule to a whole file.
-    let department: DepartmentConfig | null = null;
+    // A file whose "เลือกแผนก" header (already extracted by the parser as
+    // `truckCode`) matches one of branch.departments is classified by that
+    // department's own qty threshold and freight rule instead of the
+    // filename — a department's rules genuinely differ from another's
+    // (§2.1), so guessing wrong here would silently apply the wrong money
+    // rule to a whole file. This is a per-FILE check, not a per-branch one:
+    // กระนวน's files always match one (A7/B7/68/B3); สามทอง is a hybrid —
+    // its 6 regular trucks fall through to the flat filename-based path
+    // below exactly as before, and only a "กรอกหลังปั๊ม" (B3) file matches a
+    // configured department.
+    const department: DepartmentConfig | null = branch.departments?.find((d) => d.code === parsed.truckCode) ?? null;
     let truckLabel: string;
-    if (branch.departments) {
-      department = branch.departments.find((d) => d.code === parsed.truckCode) ?? null;
-      if (!department) {
-        warnings.push(
-          `[${file.filename}] ไม่พบ 'เลือกแผนก' ที่ตรงกับแผนกที่ตั้งค่าไว้ (พบค่า: ${parsed.truckCode ?? "ไม่พบเลย"}) — ข้ามไฟล์นี้ทั้งหมด เพราะไม่ทราบเกณฑ์ปริมาณ/ค่าขนส่งที่ถูกต้อง ต้องตรวจสอบไฟล์และตั้งค่าแผนกให้ตรงก่อน`
-        );
-        continue;
-      }
+    if (department) {
       truckLabel = department.label;
       if (!department.docPrefixes.some((p) => parsed.lines.some((l) => l.docNo.toUpperCase().startsWith(p)))) {
         warnings.push(`[${truckLabel}] เอกสารในไฟล์นี้ไม่ขึ้นต้นด้วย prefix ที่คาดไว้ (${department.docPrefixes.join("/")}) — ตรวจสอบว่าอัปโหลดไฟล์ถูกแผนกหรือไม่`);
       }
+    } else if (branch.departments && branch.minQtyLiters === undefined) {
+      // A fully department-based branch (no flat minQtyLiters at all, e.g.
+      // กระนวน) has nowhere safe to fall back to — an unrecognized "เลือกแผนก"
+      // value means the qty threshold/freight rule for this file is
+      // genuinely unknown.
+      warnings.push(
+        `[${file.filename}] ไม่พบ 'เลือกแผนก' ที่ตรงกับแผนกที่ตั้งค่าไว้ (พบค่า: ${parsed.truckCode ?? "ไม่พบเลย"}) — ข้ามไฟล์นี้ทั้งหมด เพราะไม่ทราบเกณฑ์ปริมาณ/ค่าขนส่งที่ถูกต้อง ต้องตรวจสอบไฟล์และตั้งค่าแผนกให้ตรงก่อน`
+      );
+      continue;
     } else {
       truckLabel = normalizeTruckLabel(file.filename);
     }
@@ -227,6 +234,24 @@ export async function runCommissionPipeline(
           `[${truckLabel}] checksum มูลค่าไม่ตรง: รวมจากรายการ ${computedValue.toLocaleString()} บาท แต่ไฟล์ระบุ ${parsed.grandTotal.valueTotal.toLocaleString()} บาท`
         );
       }
+    }
+
+    // Spec §4.1: "โค้ดสินค้าที่ไม่รู้จัก — เตือนผู้ใช้ ห้ามข้ามเงียบ" — a product
+    // code missing from fuelProductCodes silently fails the qty-qualifying
+    // check with no visible signal, which is exactly how กระนวน's B3 file
+    // lost ~108,000L to the DSKN/G91KN/G95KN/B20KN codes (a different SKU
+    // suffix than the plain DS/G91/G95 codes, confirmed real, not a parser
+    // bug) before anyone noticed. Surface every unrecognized code and its
+    // qty up front so a similarly-suffixed code on another branch (e.g. a
+    // future สามทอง กรอกหลังปั๊ม file) gets caught immediately instead of
+    // requiring another manual investigation.
+    const unknownProductQty = new Map<string, number>();
+    for (const line of parsed.lines) {
+      if (!fuelSet.has(line.productCode)) unknownProductQty.set(line.productCode, (unknownProductQty.get(line.productCode) ?? 0) + line.qty);
+    }
+    if (unknownProductQty.size > 0) {
+      const summary = [...unknownProductQty.entries()].map(([code, qty]) => `${code || "(ว่าง)"}=${qty.toLocaleString()}ล.`).join(", ");
+      warnings.push(`[${truckLabel}] พบรหัสสินค้าที่ไม่อยู่ใน fuelProductCodes ของสาขานี้ (ไม่นับรวมค่าคอมเลย จนกว่าจะยืนยัน): ${summary}`);
     }
 
     let excelRow = 2; // row 1 is the header; only non-walk-in rows get a row here

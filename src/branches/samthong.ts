@@ -17,10 +17,28 @@ export const samthongBranch: BranchConfig = {
   arAsOfLabel: "7 ก.ย.69",
   confirmDateLabel: "10 ก.ย.69",
 
-  fuelProductCodes: ["DS", "G91", "G95"],
+  // DS2/DSB20 and the DSKN/G91KN/G95KN/B20KN pump-SKU variants are included
+  // speculatively, NOT verified against real ST data — สามทอง's own
+  // กรอกหลังปั๊ม channel has never had a real month's PDF to check against
+  // (see `departments` below). กระนวน's B3 pump uses a "KN" SKU suffix
+  // (confirmed real, not a bug — see kranuan.ts); if สามทอง's own pump uses
+  // a DIFFERENT suffix (e.g. an "ST"-coded SKU), these codes won't match
+  // and the pipeline's own unrecognized-product-code warning (pipeline.ts)
+  // will surface it the first time a real file is uploaded — check that
+  // warning and extend this list rather than assuming it's already right.
+  fuelProductCodes: ["DS", "G91", "G95", "DS2", "DSB20", "DSKN", "G91KN", "G95KN", "B20KN"],
   minQtyLiters: 2000,
   requireExactMultiple: true,
   qtyMultipleOf: 1000,
+
+  // กรอกหลังปั๊ม (B3) — สามทองมีช่องทางนี้เหมือนกัน แต่เดือนอ้างอิง ST_8.69 ไม่มี
+  // ไฟล์แนบมา (ยืนยันจากผู้ใช้ 14 ก.ย.69) จึงยังไม่เคยตรวจกับข้อมูลจริงเลย —
+  // เงื่อนไข (ค่าขนส่งคงที่ 0.10, ไม่มีเกณฑ์ปริมาณขั้นต่ำ) อิงตามกระนวนตามที่
+  // ผู้ใช้ยืนยันให้ใช้เหมือนกัน ("ใช้เงื่อนไขเดียวกับกระนวน") — เซลล์คงที่ default
+  // เป็น "จุ่น" (ยืนยันจากผู้ใช้ 14 ก.ย.69) แก้ไขได้ที่หน้า /settings
+  // docPrefixes เป็นการเดาจากรูปแบบของกระนวน (HSB/IVB/IV) ยังไม่ยืนยัน — ผิดก็แค่
+  // ขึ้นเตือน ไม่ block การคำนวณ
+  departments: [{ code: "B3", label: "กรอกหลังปั๊ม", docPrefixes: ["HSB", "IVB", "IV"], minQtyLiters: 0, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: 0.1, fixedSalesperson: "จุ่น" }],
 
   docPrefixToSaleType: { H: "cash", I: "credit" },
 

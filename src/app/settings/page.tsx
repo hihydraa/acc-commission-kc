@@ -8,6 +8,7 @@ interface QtyRule {
   minQtyLiters: number;
   requireExactMultiple: boolean;
   qtyMultipleOf: number;
+  fixedSalesperson?: string | null;
 }
 
 interface ExcludedCustomer {
@@ -84,7 +85,7 @@ export default function SettingsPage() {
     setData({ ...data, qty: { ...data.qty, [field]: value } });
   }
 
-  function updateDeptQty(code: string, field: keyof QtyRule, value: number | boolean) {
+  function updateDeptQty(code: string, field: keyof QtyRule, value: number | boolean | string) {
     if (!data || !data.departmentQty) return;
     setData({ ...data, departmentQty: { ...data.departmentQty, [code]: { ...data.departmentQty[code], [field]: value } } });
   }
@@ -160,7 +161,9 @@ export default function SettingsPage() {
             <div className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
               <h2 className="font-semibold">เกณฑ์ปริมาณ</h2>
               {data.qty && (
-                <div className="mt-3 grid grid-cols-3 gap-3 text-sm">
+                <div className="mt-3">
+                  {data.departmentQty && <p className="mb-1 text-xs font-medium text-neutral-500">รถทั่วไป (ไฟล์ที่ไม่ตรงกับแผนกด้านล่าง)</p>}
+                  <div className="grid grid-cols-3 gap-3 text-sm">
                   <div>
                     <label className="block text-xs text-neutral-500">ปริมาณขั้นต่ำ (ลิตร/บิล)</label>
                     <input
@@ -193,9 +196,12 @@ export default function SettingsPage() {
                       disabled={!data.qty.requireExactMultiple}
                     />
                   </div>
+                  </div>
                 </div>
               )}
               {data.departmentQty && data.branch.departments && (
+                <>
+                  {data.qty && <p className="mb-1 mt-4 text-xs font-medium text-neutral-500">แยกตามแผนก</p>}
                 <div className="mt-3 overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
@@ -203,7 +209,8 @@ export default function SettingsPage() {
                         <th className="pb-1 pr-2">แผนก</th>
                         <th className="pb-1 pr-2">ปริมาณขั้นต่ำ (ลิตร/บิล)</th>
                         <th className="pb-1 pr-2">ต้องลงท้ายพันพอดี</th>
-                        <th className="pb-1">หารลงตัวด้วย</th>
+                        <th className="pb-1 pr-2">หารลงตัวด้วย</th>
+                        <th className="pb-1">เซลล์คงที่ทั้งแผนก</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -233,7 +240,7 @@ export default function SettingsPage() {
                                 <option value="yes">ต้อง</option>
                               </select>
                             </td>
-                            <td className="py-1.5">
+                            <td className="py-1.5 pr-2">
                               <input
                                 type="number"
                                 min={1}
@@ -243,12 +250,25 @@ export default function SettingsPage() {
                                 disabled={!rule.requireExactMultiple}
                               />
                             </td>
+                            <td className="py-1.5">
+                              {rule.fixedSalesperson !== null && rule.fixedSalesperson !== undefined ? (
+                                <input
+                                  placeholder="ชื่อเซลล์"
+                                  className="w-32 rounded border border-neutral-300 px-2 py-1"
+                                  value={rule.fixedSalesperson}
+                                  onChange={(e) => updateDeptQty(d.code, "fixedSalesperson", e.target.value)}
+                                />
+                              ) : (
+                                <span className="text-xs text-neutral-400">— (หาจากไฟล์ master)</span>
+                              )}
+                            </td>
                           </tr>
                         );
                       })}
                     </tbody>
                   </table>
                 </div>
+                </>
               )}
             </div>
 

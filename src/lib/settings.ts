@@ -3,29 +3,42 @@ import type { BranchConfig, ExcludedCustomer } from "@/branches/types";
 
 /**
  * User-editable overrides on top of the hardcoded BranchConfig defaults in
- * src/branches/*.ts — lets accounting adjust excluded-customer lists and qty
- * thresholds from a /settings page without a code change + redeploy for
- * every small tweak (the exact kind of change this project has needed
- * repeatedly: KNDC0018, then KNDC2075/KNDC2151, then B3's threshold itself).
+ * src/branches/*.ts — lets accounting adjust excluded-customer lists, qty
+ * thresholds, and per-department fixed-เซลล์ assignments from a /settings
+ * page without a code change + redeploy for every small tweak (the exact
+ * kind of change this project has needed repeatedly: KNDC0018, then
+ * KNDC2075/KNDC2151, then B3's threshold itself, then which เซลล์ owns
+ * กรอกหลังปั๊ม).
  *
  * Stored as a single small JSON blob in Vercel Blob (private access) rather
  * than a database — this project is otherwise intentionally stateless
  * (README: "ไม่มีฐานข้อมูล"), and a single JSON file is the smallest amount
  * of persistence that still gives every accounting user on any device the
  * SAME shared settings, which is what was asked for over localStorage.
+ *
+ * A branch can be a HYBRID of both models — สามทอง has flat qty rules for
+ * its regular trucks (filename-classified) AND a "departments" entry for
+ * its กรอกหลังปั๊ม channel (classified by the file's own "เลือกแผนก" header) —
+ * so `qty` and `departmentQty` are independent, not mutually exclusive:
+ * presence is decided by whether the branch has flat fields / a departments
+ * array at all, never by which one "wins".
  */
 
 export interface QtyRule {
   minQtyLiters: number;
   requireExactMultiple: boolean;
   qtyMultipleOf: number;
+  /** only meaningful for a department whose hardcoded config already has a
+   *  fixedSalesperson (e.g. กรอกหลังปั๊ม) — omitted/null for departments that
+   *  resolve เซลล์ via the master file as usual (A7/B7/68) */
+  fixedSalesperson?: string | null;
 }
 
 export interface BranchOverride {
   excludedCustomers: ExcludedCustomer[];
-  /** flat-model branches only (BranchConfig.departments absent) */
+  /** present only for branches with flat minQtyLiters/etc (สามทอง's regular trucks) */
   qty?: QtyRule;
-  /** department-model branches only, keyed by DepartmentConfig.code */
+  /** present only for branches with a departments array, keyed by DepartmentConfig.code */
   departmentQty?: Record<string, QtyRule>;
   updatedAt: string;
   updatedBy?: string;
@@ -70,7 +83,7 @@ export function applyBranchOverride(branch: BranchConfig, override: BranchOverri
   if (!override) return branch;
   const next: BranchConfig = { ...branch, excludedCustomers: override.excludedCustomers ?? branch.excludedCustomers };
 
-  if (!branch.departments && override.qty) {
+  if (branch.minQtyLiters !== undefined && override.qty) {
     next.minQtyLiters = override.qty.minQtyLiters;
     next.requireExactMultiple = override.qty.requireExactMultiple;
     next.qtyMultipleOf = override.qty.qtyMultipleOf;
@@ -79,7 +92,18 @@ export function applyBranchOverride(branch: BranchConfig, override: BranchOverri
   if (branch.departments && override.departmentQty) {
     next.departments = branch.departments.map((d) => {
       const o = override.departmentQty?.[d.code];
-      return o ? { ...d, minQtyLiters: o.minQtyLiters, requireExactMultiple: o.requireExactMultiple, qtyMultipleOf: o.qtyMultipleOf } : d;
+      if (!o) return d;
+      return {
+        ...d,
+        minQtyLiters: o.minQtyLiters,
+        requireExactMultiple: o.requireExactMultiple,
+        qtyMultipleOf: o.qtyMultipleOf,
+        // Only a department that already has a fixed เซลล์ concept
+        // (fixedSalesperson !== null in the hardcoded config) can have it
+        // overridden — never let a settings payload turn a normal
+        // master-lookup department into a fixed-เซลล์ one or vice versa.
+        fixedSalesperson: d.fixedSalesperson !== null ? (o.fixedSalesperson ?? d.fixedSalesperson) : null,
+      };
     });
   }
 
@@ -90,16 +114,36 @@ export function applyBranchOverride(branch: BranchConfig, override: BranchOverri
  *  or its hardcoded defaults, in the same shape either way, for the
  *  /settings page to render and the API to seed a fresh override from. */
 export function effectiveEditableState(branch: BranchConfig, override: BranchOverride | undefined) {
+  const hasFlat = branch.minQtyLiters !== undefined;
+  const hasDepartments = !!branch.departments;
   return {
     excludedCustomers: override?.excludedCustomers ?? branch.excludedCustomers,
-    qty:
-      override?.qty ??
-      (!branch.departments ? { minQtyLiters: branch.minQtyLiters ?? 0, requireExactMultiple: branch.requireExactMultiple ?? false, qtyMultipleOf: branch.qtyMultipleOf ?? 1000 } : null),
-    departmentQty:
-      override?.departmentQty ??
-      (branch.departments
-        ? Object.fromEntries(branch.departments.map((d) => [d.code, { minQtyLiters: d.minQtyLiters, requireExactMultiple: d.requireExactMultiple, qtyMultipleOf: d.qtyMultipleOf }]))
-        : null),
+    qty: hasFlat
+      ? {
+          minQtyLiters: override?.qty?.minQtyLiters ?? branch.minQtyLiters ?? 0,
+          requireExactMultiple: override?.qty?.requireExactMultiple ?? branch.requireExactMultiple ?? false,
+          qtyMultipleOf: override?.qty?.qtyMultipleOf ?? branch.qtyMultipleOf ?? 1000,
+        }
+      : null,
+    // Merged per-field (not a blind "stored override wins wholesale") so an
+    // override saved before `fixedSalesperson` existed still falls back to
+    // the hardcoded default for that one field instead of showing blank.
+    departmentQty: hasDepartments
+      ? Object.fromEntries(
+          branch.departments!.map((d) => {
+            const stored = override?.departmentQty?.[d.code];
+            return [
+              d.code,
+              {
+                minQtyLiters: stored?.minQtyLiters ?? d.minQtyLiters,
+                requireExactMultiple: stored?.requireExactMultiple ?? d.requireExactMultiple,
+                qtyMultipleOf: stored?.qtyMultipleOf ?? d.qtyMultipleOf,
+                fixedSalesperson: d.fixedSalesperson !== null ? stored?.fixedSalesperson ?? d.fixedSalesperson : null,
+              },
+            ];
+          })
+        )
+      : null,
     updatedAt: override?.updatedAt ?? null,
     updatedBy: override?.updatedBy ?? null,
   };

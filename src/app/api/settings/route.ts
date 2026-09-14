@@ -8,7 +8,11 @@ export const runtime = "nodejs";
 function isValidQtyRule(v: unknown): v is QtyRule {
   if (!v || typeof v !== "object") return false;
   const q = v as Record<string, unknown>;
-  return typeof q.minQtyLiters === "number" && q.minQtyLiters >= 0 && typeof q.requireExactMultiple === "boolean" && typeof q.qtyMultipleOf === "number" && q.qtyMultipleOf > 0;
+  if (typeof q.minQtyLiters !== "number" || q.minQtyLiters < 0) return false;
+  if (typeof q.requireExactMultiple !== "boolean") return false;
+  if (typeof q.qtyMultipleOf !== "number" || q.qtyMultipleOf <= 0) return false;
+  if (q.fixedSalesperson !== undefined && q.fixedSalesperson !== null && typeof q.fixedSalesperson !== "string") return false;
+  return true;
 }
 
 function isValidExcludedCustomers(v: unknown): v is ExcludedCustomer[] {
@@ -76,6 +80,16 @@ export async function POST(request: NextRequest) {
     updatedBy: typeof updatedBy === "string" && updatedBy.trim() ? updatedBy.trim() : undefined,
   };
 
+  // A branch can be a hybrid (สามทอง: flat rules for its regular trucks +
+  // a departments entry for กรอกหลังปั๊ม) — these are independent, not
+  // mutually exclusive, so both get validated/saved when both apply.
+  if (branch.minQtyLiters !== undefined) {
+    if (!isValidQtyRule(qty)) {
+      return NextResponse.json({ error: "เกณฑ์ปริมาณไม่ถูกต้อง" }, { status: 400 });
+    }
+    override.qty = { minQtyLiters: qty.minQtyLiters, requireExactMultiple: qty.requireExactMultiple, qtyMultipleOf: qty.qtyMultipleOf };
+  }
+
   if (branch.departments) {
     if (!departmentQty || typeof departmentQty !== "object") {
       return NextResponse.json({ error: "ไม่ได้ระบุเกณฑ์ปริมาณต่อแผนก (departmentQty)" }, { status: 400 });
@@ -87,14 +101,17 @@ export async function POST(request: NextRequest) {
       if (!isValidQtyRule(rule)) {
         return NextResponse.json({ error: `เกณฑ์ปริมาณของแผนก '${dept.label}' (${dept.code}) ไม่ถูกต้อง` }, { status: 400 });
       }
-      validated[dept.code] = rule;
+      validated[dept.code] = {
+        minQtyLiters: rule.minQtyLiters,
+        requireExactMultiple: rule.requireExactMultiple,
+        qtyMultipleOf: rule.qtyMultipleOf,
+        // Only departments that already have a fixed เซลล์ concept can have
+        // one saved — ignore the field entirely for A7/B7/68-style
+        // departments even if the client sent one.
+        fixedSalesperson: dept.fixedSalesperson !== null ? (typeof rule.fixedSalesperson === "string" ? rule.fixedSalesperson.trim() || null : dept.fixedSalesperson) : null,
+      };
     }
     override.departmentQty = validated;
-  } else {
-    if (!isValidQtyRule(qty)) {
-      return NextResponse.json({ error: "เกณฑ์ปริมาณไม่ถูกต้อง" }, { status: 400 });
-    }
-    override.qty = qty;
   }
 
   await saveBranchOverride(branchId, override);
