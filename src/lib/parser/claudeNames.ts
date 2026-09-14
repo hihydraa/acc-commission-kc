@@ -267,8 +267,14 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
           // code this batch didn't actually ask about.
           if (expectedCodes.has(code)) namesByCode.set(code, name);
         }
-      } catch {
+      } catch (err) {
         apiErrors++;
+        if (apiErrors <= 2) {
+          // TEMP DIAGNOSTIC: surface the actual SDK error for the first
+          // couple of failures instead of just a count, to find out WHY
+          // (e.g. an invalid/inaccessible model id) rather than guessing.
+          warnings.push(`[แก้ชื่อภาษาไทยด้วย Claude][debug] ${err instanceof Error ? err.message : String(err)}`);
+        }
         // one bad batch (network hiccup, rate limit, malformed response)
         // must never take the rest of the run down with it — those codes
         // just keep their existing (uncorrected) name.
