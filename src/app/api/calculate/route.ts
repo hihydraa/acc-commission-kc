@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getBranchById, BRANCHES } from "@/branches";
 import { runCommissionPipeline, type InputFile } from "@/lib/pipeline";
+import { loadSettings, applyBranchOverride } from "@/lib/settings";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -17,10 +18,14 @@ export async function POST(request: NextRequest) {
     if (typeof branchId !== "string") {
       return NextResponse.json({ error: "ไม่ได้ระบุสาขา (branchId)" }, { status: 400 });
     }
-    const branch = getBranchById(branchId);
-    if (!branch) {
+    const baseBranch = getBranchById(branchId);
+    if (!baseBranch) {
       return NextResponse.json({ error: `ไม่พบสาขา '${branchId}' — สาขาที่รองรับ: ${BRANCHES.map((b) => b.id).join(", ")}` }, { status: 400 });
     }
+    // Merge any settings saved via /settings (excluded customers, qty
+    // thresholds) on top of the hardcoded defaults — see src/lib/settings.ts.
+    const settings = await loadSettings();
+    const branch = applyBranchOverride(baseBranch, settings[branchId]);
 
     const salesFileEntries = form.getAll("salesFiles").filter((f): f is File => f instanceof File);
     const arFileEntry = form.get("arFile");

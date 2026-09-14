@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { BRANCHES } from "@/branches";
 
 interface CalcSummary {
@@ -89,12 +90,17 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-neutral-50 px-4 py-10 text-neutral-900">
       <div className="mx-auto max-w-2xl space-y-6">
-        <header>
-          <h1 className="text-2xl font-bold">ระบบคำนวณค่าคอมมิชชั่นฝ่ายการตลาด</h1>
-          <p className="mt-1 text-sm text-neutral-600">
-            อัปโหลดไฟล์ PDF รายงานขายรายคันรถ (หลายไฟล์), รายงานลูกหนี้ค้างชำระ, และไฟล์ master ระยะทาง/เซลล์ (ถ้ามี) —
-            ระบบจะคำนวณและสร้างไฟล์ Excel ตาม Template ให้อัตโนมัติ
-          </p>
+        <header className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-bold">ระบบคำนวณค่าคอมมิชชั่นฝ่ายการตลาด</h1>
+            <p className="mt-1 text-sm text-neutral-600">
+              อัปโหลดไฟล์ PDF รายงานขายรายคันรถ (หลายไฟล์), รายงานลูกหนี้ค้างชำระ, และไฟล์ master ระยะทาง/เซลล์ (ถ้ามี) —
+              ระบบจะคำนวณและสร้างไฟล์ Excel ตาม Template ให้อัตโนมัติ
+            </p>
+          </div>
+          <Link href="/settings" className="whitespace-nowrap text-sm text-neutral-600 underline">
+            ตั้งค่าเงื่อนไข →
+          </Link>
         </header>
 
         <form onSubmit={handleSubmit} className="space-y-5 rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
