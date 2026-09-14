@@ -43,7 +43,17 @@ import Anthropic from "@anthropic-ai/sdk";
  */
 
 const MODEL = "claude-haiku-4-5-20251001";
-const CROP_SCALE = 4; // crops are small, so a sharper render is cheap either way
+// Rendering a crop still means rasterizing the WHOLE page first (pdfjs has
+// no partial-region render) — a production run with ~80 customers spread
+// across a 41-page report meant ~80 separate full-page rasters at scale 4
+// with nothing capping the time spent, which is exactly what took the whole
+// request past Vercel's function limit (confirmed: the deployed endpoint
+// started returning the platform's own generic 500 instead of this
+// pipeline's own JSON error, meaning the function was killed before it
+// could respond at all). Scale 2 cuts that raster cost ~4x; the real fix is
+// the `deadline` check in the page loops below, which this alone doesn't
+// replace.
+const CROP_SCALE = 2;
 const CROPS_PER_REQUEST = 20;
 const REQUEST_CONCURRENCY = 3;
 // Overall wall-clock budget for every Claude call in one pipeline run —
@@ -107,13 +117,19 @@ async function loadCanvasFactory(): Promise<CanvasFactory> {
  *    vertical margin is kept small to avoid bleeding into the row above/
  *    below (verified: a generous margin picks up the previous row's text).
  */
-async function collectCropTargets(buffer: Buffer, remaining: Set<string>, isMaster: boolean): Promise<{ doc: PdfDoc; targetsByPage: Map<number, CropTarget[]> }> {
+async function collectCropTargets(
+  buffer: Buffer,
+  remaining: Set<string>,
+  isMaster: boolean,
+  deadline: number
+): Promise<{ doc: PdfDoc; targetsByPage: Map<number, CropTarget[]>; timedOut: boolean }> {
   const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buffer), stopAtErrors: false, isEvalSupported: false }).promise;
   const targetsByPage = new Map<number, CropTarget[]>();
-  if (remaining.size === 0) return { doc, targetsByPage };
+  if (remaining.size === 0) return { doc, targetsByPage, timedOut: false };
 
   for (let pageNum = 1; pageNum <= doc.numPages && remaining.size > 0; pageNum++) {
+    if (Date.now() > deadline) return { doc, targetsByPage, timedOut: true };
     const page = await doc.getPage(pageNum);
     const viewport = page.getViewport({ scale: CROP_SCALE });
     const content = await page.getTextContent({ disableNormalization: true });
@@ -164,7 +180,7 @@ async function collectCropTargets(buffer: Buffer, remaining: Set<string>, isMast
     }
     if (targets.length > 0) targetsByPage.set(pageNum, targets);
   }
-  return { doc, targetsByPage };
+  return { doc, targetsByPage, timedOut: false };
 }
 
 /** Renders `pageNum` once and cuts every one of its crop targets out of
@@ -260,14 +276,31 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
   const client = new Anthropic({ apiKey });
   const createCanvas = await loadCanvasFactory();
 
+  // ONE deadline for the whole function, not one per phase — rendering a
+  // crop still means rasterizing its entire page first (pdfjs has no
+  // partial-region render), so with a customer spread thinly across a
+  // multi-hundred-page report, the RENDER phase can be just as expensive as
+  // the API-call phase. A budget that only covered the API phase let a real
+  // production run render ~80 separate full pages with nothing capping the
+  // time spent, which ran the whole request past Vercel's own function
+  // limit and killed it before this module's own graceful-fallback warnings
+  // could ever be returned.
+  const deadline = Date.now() + TOTAL_BUDGET_MS;
+  let renderTimedOut = false;
+
   const remaining = new Set(targetCodes);
   const cropJobs: CropJob[] = [];
 
   async function collect(buffer: Buffer, source: string, isMaster: boolean) {
-    if (remaining.size === 0) return;
+    if (remaining.size === 0 || Date.now() > deadline) return;
     try {
-      const { doc, targetsByPage } = await collectCropTargets(buffer, remaining, isMaster);
+      const { doc, targetsByPage, timedOut } = await collectCropTargets(buffer, remaining, isMaster, deadline);
+      if (timedOut) renderTimedOut = true;
       for (const [pageNum, targets] of targetsByPage) {
+        if (Date.now() > deadline) {
+          renderTimedOut = true;
+          break;
+        }
         cropJobs.push(...(await renderCrops(doc, pageNum, targets, createCanvas)));
       }
     } catch (err) {
@@ -278,13 +311,17 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
   if (masterFile) await collect(masterFile, "master", true);
   for (const f of salesFiles) await collect(f.buffer, f.filename, false);
 
-  if (cropJobs.length === 0) return { namesByCode, warnings };
+  if (cropJobs.length === 0) {
+    if (renderTimedOut) {
+      warnings.push(`[แก้ชื่อภาษาไทยด้วย Claude] อ่าน/แปลงหน้า PDF ใช้เวลาเกิน ${TOTAL_BUDGET_MS / 1000} วินาที ก่อนจะเริ่มแก้ชื่อได้แม้แต่รายการเดียว — ใช้ชื่อจากไฟล์ตามปกติทั้งหมด`);
+    }
+    return { namesByCode, warnings };
+  }
 
   const batches: CropJob[][] = [];
   for (let i = 0; i < cropJobs.length; i += CROPS_PER_REQUEST) batches.push(cropJobs.slice(i, i + CROPS_PER_REQUEST));
 
-  const deadline = Date.now() + TOTAL_BUDGET_MS;
-  let timedOut = false;
+  let timedOut = renderTimedOut;
   let nextBatch = 0;
   let apiErrors = 0;
 
