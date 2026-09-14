@@ -220,7 +220,14 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
     warnings.push("[แก้ชื่อภาษาไทยด้วย Claude] ไม่ได้ตั้งค่า ANTHROPIC_API_KEY — ข้ามการแก้ชื่อรอบนี้ทั้งหมด ใช้ชื่อจากไฟล์ตามปกติแทน");
     return { namesByCode, warnings };
   }
-  const client = new Anthropic({ apiKey });
+  // The previous Sonnet-model diagnostic run returned a 504 (the platform's
+  // own gateway timeout) instead of this module's own graceful-degradation
+  // warnings — the SDK's default retry/backoff on a failing call can eat far
+  // more wall-clock time per call than our own `deadline` check (which only
+  // gates *starting* a new batch, not an in-flight one) accounts for.
+  // maxRetries: 1 and a short per-call timeout keep one bad call from
+  // silently consuming the whole request's time budget.
+  const client = new Anthropic({ apiKey, timeout: 15_000, maxRetries: 1 });
 
   const deadline = Date.now() + TOTAL_BUDGET_MS;
   const remaining = new Set(targetCodes);
