@@ -235,6 +235,55 @@ function commissionFormula(r: number, branch: BranchConfig, scope: SheetScope): 
 const HIGHLIGHT_FILL: ExcelJS.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
 const EXCLUDE_FILL: ExcelJS.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF4CCCC" } };
 
+/**
+ * Matches the user's own approved template (คำนวณค่าคอม_ST_8.69_3.xlsx,
+ * inspected cell-by-cell with exceljs) exactly: dark-blue table headers with
+ * white bold text and a thin grey grid over every cell, light-blue highlight
+ * on each sheet's grand-total row(s). numFmt is deliberately left at
+ * "General" everywhere — the template itself uses General throughout, never
+ * a comma/currency format.
+ */
+const THIN_GREY = { style: "thin" as const, color: { argb: "FFBBBBBB" } };
+const CELL_BORDER: Partial<ExcelJS.Borders> = { top: THIN_GREY, bottom: THIN_GREY, left: THIN_GREY, right: THIN_GREY };
+const HEADER_FILL: ExcelJS.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1F4E78" } };
+const HEADER_FONT: Partial<ExcelJS.Font> = { bold: true, size: 10, color: { argb: "FFFFFFFF" }, name: "FreeSans" };
+const HEADER_ALIGNMENT: Partial<ExcelJS.Alignment> = { horizontal: "center", vertical: "middle", wrapText: true };
+const HEADER_ROW_HEIGHT = 23;
+const TOTAL_FILL: ExcelJS.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9E1F2" } };
+const TOTAL_FONT: Partial<ExcelJS.Font> = { bold: true, size: 10, name: "FreeSans" };
+
+/** Styles a header row in place: dark-blue fill, white bold text, centered
+ *  wrap, thin grey border — `colCount` because a freshly-added header row's
+ *  own cell count already matches its header array, but a later-styled row
+ *  (added via getRow(n) before any addRow) needs the column count spelled
+ *  out explicitly. */
+function styleHeaderRow(row: ExcelJS.Row, colCount: number) {
+  row.height = HEADER_ROW_HEIGHT;
+  for (let c = 1; c <= colCount; c++) {
+    const cell = row.getCell(c);
+    cell.font = HEADER_FONT;
+    cell.fill = HEADER_FILL;
+    cell.alignment = HEADER_ALIGNMENT;
+    cell.border = CELL_BORDER;
+  }
+}
+
+/** Thin grey border on every cell of a data row, including ones with no
+ *  value — the template's grid covers the full table width, not just
+ *  populated cells (an empty cell still shows its grid line). */
+function styleDataRowBorders(row: ExcelJS.Row, colCount: number) {
+  for (let c = 1; c <= colCount; c++) row.getCell(c).border = CELL_BORDER;
+}
+
+function styleTotalRow(row: ExcelJS.Row, colCount: number) {
+  for (let c = 1; c <= colCount; c++) {
+    const cell = row.getCell(c);
+    cell.font = TOTAL_FONT;
+    cell.fill = TOTAL_FILL;
+    cell.border = CELL_BORDER;
+  }
+}
+
 export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promise<ArrayBuffer> {
   const { branch } = input;
   const workbook = new ExcelJS.Workbook();
@@ -245,9 +294,10 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   const usedSheetNames = new Set<string>();
 
   // ---------- Master ----------
+  const MASTER_HEADER = ["รหัสลูกค้า", "เซลล์", "ระยะทาง(กม.)", "Tag", "ชื่อลูกค้า", "ที่มา"];
   const masterSheet = workbook.addWorksheet(safeSheetName("Master", usedSheetNames));
-  masterSheet.addRow(["รหัสลูกค้า", "เซลล์", "ระยะทาง(กม.)", "Tag", "ชื่อลูกค้า", "ที่มา"]);
-  masterSheet.getRow(1).font = { bold: true };
+  masterSheet.addRow(MASTER_HEADER);
+  styleHeaderRow(masterSheet.getRow(1), MASTER_HEADER.length);
   for (const m of input.masterRows) {
     // Exclusion is channel-scoped now (branch-flat vs per-department — see
     // DepartmentConfig.excludedCustomers), so `masterRows` itself already
@@ -257,12 +307,11 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     const isExcluded = m.salesperson.startsWith("ตัดออก");
     const isUserConfirmed = m.sourceText.startsWith("ยืนยันจากผู้ใช้");
     const row = masterSheet.addRow([m.customerCode, m.salesperson, m.distanceKm, m.tag, m.customerName, m.sourceText]);
+    styleDataRowBorders(row, MASTER_HEADER.length);
     if (isExcluded) row.eachCell((c) => (c.fill = EXCLUDE_FILL));
     else if (isUserConfirmed) row.eachCell((c) => (c.fill = HIGHLIGHT_FILL));
   }
-  masterSheet.columns.forEach((c) => (c.width = 22));
-  masterSheet.getColumn(5).width = 32;
-  masterSheet.getColumn(6).width = 46;
+  [14, 26, 12, 12, 32, 50].forEach((w, i) => (masterSheet.getColumn(i + 1).width = w));
 
   // ---------- per-truck sheets ----------
   const TRUCK_HEADER = [
@@ -278,7 +327,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     truckSheetNameByLabel.set(truckLabel, sheetName);
     const sheet = workbook.addWorksheet(sheetName);
     sheet.addRow(TRUCK_HEADER);
-    sheet.getRow(1).font = { bold: true };
+    styleHeaderRow(sheet.getRow(1), TRUCK_HEADER.length);
 
     const scope = input.truckScopes.get(truckLabel) ?? {
       minQtyLiters: branch.minQtyLiters ?? 0,
@@ -323,6 +372,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
         fv(commissionFormula(excelRow, branch, scope), r.calc.commission),
         noteParts.join("; "),
       ]);
+      styleDataRowBorders(sheet.getRow(excelRow), TRUCK_HEADER.length);
       if (r.calc.blocked) sheet.getRow(excelRow).eachCell((c) => (c.fill = EXCLUDE_FILL));
     });
 
@@ -344,13 +394,11 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       sheet.getRow(qualifyingRow).getCell(5).value = "รวมเฉพาะรายการที่เข้าเกณฑ์ค่าคอม";
       sheet.getRow(qualifyingRow).getCell(9).value = fv(`SUMPRODUCT(${qualifyCond}*${qtyRange})`, qualifyingQty);
       sheet.getRow(qualifyingRow).getCell(20).value = fv(`SUM(T2:T${lastDataRow})`, totalComm);
-      sheet.getRow(totalRow).font = { bold: true };
-      sheet.getRow(qualifyingRow).font = { bold: true };
+      styleTotalRow(sheet.getRow(totalRow), TRUCK_HEADER.length);
+      styleTotalRow(sheet.getRow(qualifyingRow), TRUCK_HEADER.length);
     }
 
-    sheet.columns.forEach((c) => (c.width = 15));
-    sheet.getColumn(5).width = 26;
-    sheet.getColumn(21).width = 42;
+    [6, 10, 16, 12, 26, 14, 10, 10, 14, 12, 12, 12, 10, 12, 12, 14, 10, 10, 10, 10, 42].forEach((w, i) => (sheet.getColumn(i + 1).width = w));
   }
 
   // Sheet objects are created here, in this order, purely to fix the tab
@@ -367,8 +415,8 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     branch.debtDeductionMode === "auto"
       ? `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} (ทุกชนิดน้ำมันที่เข้าเกณฑ์) — บิลที่จ่ายมาบางส่วนแล้ว คิดเฉพาะสัดส่วนที่ยังค้างเท่านั้น ไม่ใช่เต็มบิล`
       : `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} — รายการนี้เป็น "การแจ้งเตือน" เท่านั้น ยังไม่ได้หักออกจากค่าคอมสุทธิ (ดูชีทค่าคอมรวม คอลัมน์ "หนี้ค้างที่ต้องพิจารณา" ที่ตั้งต้น 0) บัญชีต้องพิจารณาหักเอง 50%/100% ตาม policy ข้อ 6-7`;
-  debtSheet.getRow(1).font = { bold: true };
-  debtSheet.addRow([
+  debtSheet.getRow(1).font = { bold: true, size: 13 };
+  const DEBT_HEADER = [
     "รหัสลูกค้า",
     "ชื่อลูกค้า",
     "เอกสาร#",
@@ -378,8 +426,9 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     branch.debtDeductionMode === "auto" ? "ค่าคอมที่หัก (เฉพาะส่วนที่ยังค้าง)" : "ค่าคอมของส่วนที่ยังค้าง (บาท) — อ้างอิงเท่านั้น",
     `ยอดคงค้าง (บาท) ตามรายงานลูกหนี้ ${branch.arAsOfLabel}`,
     "สถานะการจ่าย",
-  ]);
-  debtSheet.getRow(2).font = { bold: true };
+  ];
+  debtSheet.addRow(DEBT_HEADER);
+  styleHeaderRow(debtSheet.getRow(2), DEBT_HEADER.length);
   const debtRows = input.rows.filter((r) => (r.outstandingAmount ?? 0) > 0);
   for (const r of debtRows) {
     const s = truckSheetNameByLabel.get(r.truckLabel)!;
@@ -402,6 +451,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       r.arOutstandingReference,
       isPartial ? `จ่ายบางส่วนแล้ว — คิดเฉพาะส่วนที่ยังค้าง (${((r.outstandingFraction ?? 1) * 100).toFixed(1)}% ของบิล)` : "ค้างเต็มบิล",
     ]);
+    styleDataRowBorders(debtSheet.lastRow!, DEBT_HEADER.length);
   }
   const debtDataLast = debtRows.length + 2;
   const debtInformationalTotal = debtRows.reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
@@ -411,8 +461,8 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     debtSheet.getCell(`B${debtDataLast + 2}`).value = fv(`SUM(E3:E${debtDataLast})`, input.debtQtyTotal);
     debtSheet.getCell(`A${debtDataLast + 3}`).value = branch.debtDeductionMode === "auto" ? "รวมค่าคอมที่ต้องหัก" : "รวมค่าคอมของรายการที่ต้องพิจารณา (อ้างอิงเท่านั้น — ยังไม่ได้หัก)";
     debtSheet.getCell(`B${debtDataLast + 3}`).value = fv(`SUM(G3:G${debtDataLast})`, debtInformationalTotal);
-    debtSheet.getRow(debtDataLast + 2).font = { bold: true };
-    debtSheet.getRow(debtDataLast + 3).font = { bold: true };
+    styleTotalRow(debtSheet.getRow(debtDataLast + 2), 2);
+    styleTotalRow(debtSheet.getRow(debtDataLast + 3), 2);
     const noteStart = debtDataLast + 5;
     debtSheet.getCell(`A${noteStart}`).value = "หมายเหตุ:";
     debtSheet.getCell(`A${noteStart + 1}`).value =
@@ -432,9 +482,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   } else {
     debtSheet.addRow(["ไม่พบรายการค้างชำระที่ตรงกับรายการเข้าเกณฑ์เดือนนี้"]);
   }
-  debtSheet.columns.forEach((c) => (c.width = 20));
-  debtSheet.getColumn(2).width = 28;
-  debtSheet.getColumn(1).width = 90;
+  [13, 30, 15, 10, 22, 10, 20, 26].forEach((w, i) => (debtSheet.getColumn(i + 1).width = w));
 
   // ---------- ค่าคอมรวม ----------
   const qtyColumnLabel = `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ ${qtyRuleDescription(branch, "L")} ทุกชนิดน้ำมัน)`;
@@ -442,8 +490,9 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     branch.debtDeductionMode === "auto"
       ? "หักค่าคอมจากหนี้ค้างชำระ"
       : "หนี้ค้างที่ต้องพิจารณา (บาท) — บัญชีปรับเอง ตั้งต้น 0";
-  summarySheet.addRow(["เซลล์", qtyColumnLabel, "ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)", debtColumnLabel, "ค่าคอมสุทธิ"]);
-  summarySheet.getRow(1).font = { bold: true };
+  const SUMMARY_HEADER = ["เซลล์", qtyColumnLabel, "ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)", debtColumnLabel, "ค่าคอมสุทธิ"];
+  summarySheet.addRow(SUMMARY_HEADER);
+  styleHeaderRow(summarySheet.getRow(1), SUMMARY_HEADER.length);
   const perSalesperson = branch.salespersonRoster.map((name) => {
     const rows = input.rows.filter((r) => r.salesperson === name);
     const liters = rows.filter((r) => r.calc.qualifiesByQty).reduce((s, r) => s + r.qty, 0);
@@ -481,6 +530,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
         ? fv(`SUMIF(หักหนี้ค้างชำระ!$F:$F,$A${r},หักหนี้ค้างชำระ!$G:$G)`, agg.debt)
         : 0; // literal, not a formula — see comment on `perSalesperson` above
     summarySheet.addRow([name, fv(qtyTerms.join("+"), agg.liters), fv(commTerms.join("+"), agg.gross), debtCell, fv(`C${r}-D${r}`, agg.net)]);
+    styleDataRowBorders(summarySheet.lastRow!, SUMMARY_HEADER.length);
   });
   const grandRow = branch.salespersonRoster.length + 2;
   summarySheet.getRow(grandRow).getCell(1).value = "รวมทั้งหมด";
@@ -494,9 +544,8 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     const val = [grandTotals.liters, grandTotals.gross, grandTotals.debt, grandTotals.net][i];
     summarySheet.getCell(`${col}${grandRow}`).value = fv(`SUM(${col}2:${col}${grandRow - 1})`, val);
   });
-  summarySheet.getRow(grandRow).font = { bold: true };
-  summarySheet.columns.forEach((c) => (c.width = 24));
-  summarySheet.getColumn(2).width = 36;
+  styleTotalRow(summarySheet.getRow(grandRow), SUMMARY_HEADER.length);
+  [14, 46, 26, 26, 18].forEach((w, i) => (summarySheet.getColumn(i + 1).width = w));
 
   // ---------- ใบปะหน้า ----------
   const coverSheet = workbook.addWorksheet(safeSheetName("ใบปะหน้า", usedSheetNames));
@@ -511,12 +560,12 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   coverSheet.mergeCells(3, 1, 3, branch.teamSplit.roles.length + 2);
   coverSheet.getCell("A3").value =
     `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${[...new Set(branch.fuelProductCodes.map(productLabel))].join("+")} ที่ ${qtyRuleDescription(branch, "ลิตร")} | ไม่รวมลูกค้า${allExcludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
-  coverSheet.getRow(3).font = { italic: true };
 
   const splitHeaderRow = 5;
+  const coverColCount = branch.teamSplit.roles.length + 2;
   const colLetterForRoleIdx = (i: number) => String.fromCharCode("C".charCodeAt(0) + i);
   coverSheet.getRow(splitHeaderRow).values = ["เจ้าของยอด (เซลล์)", "ค่าคอมสุทธิ (บาท)", ...branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`)];
-  coverSheet.getRow(splitHeaderRow).font = { bold: true };
+  styleHeaderRow(coverSheet.getRow(splitHeaderRow), coverColCount);
   const roleTotalsByCol = new Map<number, number>(); // 1-indexed column -> sum, for the รวม row
   branch.salespersonRoster.forEach((name, i) => {
     const srcRow = i + 2; // ค่าคอมรวม row for this salesperson
@@ -551,6 +600,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       }
     });
     coverSheet.addRow(cells);
+    styleDataRowBorders(coverSheet.lastRow!, coverColCount);
   });
   const totalRow = splitHeaderRow + 1 + branch.salespersonRoster.length;
   const totalCells: (string | { formula: string; result?: number | string })[] = ["รวม"];
@@ -559,19 +609,29 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     totalCells.push(fv(`SUM(${col}${splitHeaderRow + 1}:${col}${totalRow - 1})`, roleTotalsByCol.get(c) ?? 0));
   }
   coverSheet.getRow(totalRow).values = totalCells;
-  coverSheet.getRow(totalRow).font = { bold: true };
-  coverSheet.columns.forEach((c) => (c.width = 22));
+  styleTotalRow(coverSheet.getRow(totalRow), coverColCount);
+  coverSheet.columns.forEach((c) => (c.width = 20));
+  coverSheet.getColumn(1).width = 16;
+  coverSheet.getColumn(2).width = 16;
 
   // ---------- หมายเหตุ ----------
   const notesSheet = workbook.addWorksheet(safeSheetName("หมายเหตุ", usedSheetNames));
   let nr = 1;
   const addTitle = (text: string) => {
     notesSheet.getCell(`A${nr}`).value = text;
-    notesSheet.getRow(nr).font = { bold: true };
+    notesSheet.getRow(nr).font = { bold: true, size: 13, name: "FreeSans" };
     nr += 2;
   };
   const addLine = (text: string) => {
     notesSheet.getCell(`A${nr}`).value = text;
+    nr++;
+  };
+  /** A numbered section header (e.g. "1) ขอบเขตข้อมูลที่ใช้") — bold like a
+   *  title but without addTitle's extra blank line, since the section's own
+   *  content follows immediately underneath it. */
+  const addSectionHeader = (text: string) => {
+    notesSheet.getCell(`A${nr}`).value = text;
+    notesSheet.getRow(nr).font = { bold: true, size: 10 };
     nr++;
   };
   const blank = () => {
@@ -581,13 +641,13 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   notesSheet.mergeCells(1, 1, 1, 2);
   addTitle(`หมายเหตุและข้อสมมติฐานในการคำนวณค่าคอม ${branch.id.toUpperCase()} เดือน ${branch.periodLabel}`);
 
-  addLine("1) ขอบเขตข้อมูลที่ใช้");
+  addSectionHeader("1) ขอบเขตข้อมูลที่ใช้");
   addLine(`- ไฟล์ยอดขายรายรถ: ${input.truckLabels.join(", ")} (ทั้งหมดในโฟลเดอร์ ${branch.dataFolderLabel})`);
   addLine(`- ไฟล์ระยะทาง/เซลล์: '${branch.masterFileLabel}'`);
   addLine(`- ไฟล์ลูกหนี้คงค้าง: รายงานลูกหนี้คงค้างแบบละเอียด ณ ${branch.arAsOfLabel}`);
   blank();
 
-  addLine("2) เกณฑ์การกรองรายการที่เข้าเกณฑ์ค่าคอม");
+  addSectionHeader("2) เกณฑ์การกรองรายการที่เข้าเกณฑ์ค่าคอม");
   addLine(`- รวมน้ำมันใสทุกชนิด: ${[...new Set(branch.fuelProductCodes.map(productLabel))].join(", ")}`);
   if (branch.minQtyLiters !== undefined) {
     addLine(
@@ -604,7 +664,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   addLine("- ไม่ได้ตรวจการรวมบิลย่อยที่ต่ำกว่าเกณฑ์ของลูกค้ารายเดียวกันในวันเดียวกัน หากพบควรให้ผู้ใช้ยืนยันก่อนรวมบิล");
   blank();
 
-  addLine("3) ลูกค้าที่ตัดออกจากค่าคอมการตลาด");
+  addSectionHeader("3) ลูกค้าที่ตัดออกจากค่าคอมการตลาด");
   // Exclusion is channel-scoped (branch-flat for รถทั่วไป vs each
   // department's own list — see DepartmentConfig.excludedCustomers), so
   // each entry is labeled with which channel it applies to rather than
@@ -626,14 +686,14 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   addLine("- หากพบลูกค้ารถมิเตอร์รายอื่นปะปนอยู่ในรายงานยอดขายสาขา ควรตรวจสอบและตัดออกในลักษณะเดียวกัน");
   blank();
 
-  addLine("4) ประเภท (ขายสด/ขายเชื่อ)");
+  addSectionHeader("4) ประเภท (ขายสด/ขายเชื่อ)");
   addLine("- ใช้กฎ: เลขที่เอกสารขึ้นต้นด้วย H = ขายสด, ขึ้นต้นด้วย I = ขายเชื่อ (ไม่ใช่ 100% แน่นอน — ควรสุ่มตรวจกับระบบบัญชีเป็นระยะ)");
   addLine(
     `- เกณฑ์กำไรต่อลิตร (ขายสด>=${(branch.thresholds.cash * 100).toFixed(0)}สต./ลิตร, ขายเชื่อ>=${(branch.thresholds.credit * 100).toFixed(0)}สต./ลิตร, ค้างชำระ>=${(branch.thresholds.overdue * 100).toFixed(0)}สต./ลิตร, อัตรา ${(branch.ratePerLiter * 100).toFixed(0)}สต./ลิตร) ใช้เกณฑ์เดียวกันทุกชนิดน้ำมัน`
   );
   blank();
 
-  addLine("5) ค่าขนส่ง/ระยะทาง");
+  addSectionHeader("5) ค่าขนส่ง/ระยะทาง");
   addLine(`- ระยะทาง(กม.) และเซลล์ต่อรหัสลูกค้า อ้างอิงจากไฟล์ '${branch.masterFileLabel}'`);
   if (branch.masterOverrides.length > 0) {
     addLine(
@@ -663,7 +723,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   }
   blank();
 
-  addLine(branch.debtDeductionMode === "auto" ? "6) การหักค่าคอมจากหนี้ที่ยังเก็บไม่ได้" : "6) หนี้ค้างที่ต้องพิจารณา (ยังไม่ได้หักอัตโนมัติ)");
+  addSectionHeader(branch.debtDeductionMode === "auto" ? "6) การหักค่าคอมจากหนี้ที่ยังเก็บไม่ได้" : "6) หนี้ค้างที่ต้องพิจารณา (ยังไม่ได้หักอัตโนมัติ)");
   if (input.debtQtyTotal === 0) {
     addLine(`- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — ไม่พบรายการที่ตรงกันในรอบนี้`);
   } else if (branch.debtDeductionMode === "auto") {
@@ -677,12 +737,12 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   }
   blank();
 
-  addLine("7) บรรทัดสรุปในแต่ละชีทรถ");
+  addSectionHeader("7) บรรทัดสรุปในแต่ละชีทรถ");
   addLine("- ท้ายชีทของรถแต่ละคัน มี 2 บรรทัดสรุป: 'รวมทั้งชีท' และ 'รวมเฉพาะรายการที่เข้าเกณฑ์ค่าคอม' — ยอดค่าคอมรวมของทุกชีทรถบวกกันต้องเท่ากับยอด 'ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)' ในชีท ค่าคอมรวม ถ้าไม่ตรงกันคือบั๊ก ต้องตามหาก่อนส่งมอบ");
   blank();
 
   const sentinelRows = input.rows.filter((r) => r.calc.commission === "ตรวจสอบประเภท(R)");
-  addLine("8) เรื่องที่ยังไม่ได้คำนวณอัตโนมัติ / ควรตรวจสอบเพิ่มเติม");
+  addSectionHeader("8) เรื่องที่ยังไม่ได้คำนวณอัตโนมัติ / ควรตรวจสอบเพิ่มเติม");
   for (const note of input.standingNotes) addLine(`- ${note}`);
   addLine(
     sentinelRows.length === 0
@@ -693,12 +753,12 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   blank();
 
   if (input.warnings.length > 0) {
-    addLine("9) คำเตือนจากระบบ (parsing/checksum)");
+    addSectionHeader("9) คำเตือนจากระบบ (parsing/checksum)");
     for (const w of input.warnings.slice(0, 30)) addLine(`- ${w}`);
     if (input.warnings.length > 30) addLine(`- ... และอีก ${input.warnings.length - 30} รายการ`);
   }
 
-  notesSheet.getColumn(1).width = 120;
+  notesSheet.getColumn(1).width = 140;
   notesSheet.eachRow((row) => row.eachCell((c) => (c.alignment = { wrapText: true, vertical: "top" })));
 
   const buf = await workbook.xlsx.writeBuffer();
