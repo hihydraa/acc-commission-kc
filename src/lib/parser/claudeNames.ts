@@ -33,7 +33,12 @@ import Anthropic from "@anthropic-ai/sdk";
 
 const MODEL = "claude-haiku-4-5-20251001";
 const RENDER_SCALE = 2; // moderate — a vision model reading printed text doesn't need Tesseract's ~288dpi
-const PAGES_PER_REQUEST = 6;
+// Kept modest (not the original 6) — more images sharing one request means
+// more chances for the model to blend two unlabeled-looking customers
+// together even with per-image code labels; a smaller batch is cheap
+// insurance against that (see callClaudeForBatch's own comment for the
+// production run that motivated this).
+const PAGES_PER_REQUEST = 3;
 const REQUEST_CONCURRENCY = 3;
 // Overall wall-clock budget for every Claude call in one pipeline run — see
 // ocrNames.ts-era note this replaces: leaves headroom under the API route's
@@ -139,25 +144,39 @@ function extractJson(text: string): unknown {
   return JSON.parse(body.slice(start, end + 1));
 }
 
-async function callClaudeForBatch(client: Anthropic, pages: { source: string; pageNum: number; png: Buffer }[], codes: string[]): Promise<Map<string, string>> {
+async function callClaudeForBatch(client: Anthropic, pages: { source: string; pageNum: number; codes: string[]; png: Buffer }[]): Promise<Map<string, string>> {
   const result = new Map<string, string>();
-  if (codes.length === 0 || pages.length === 0) return result;
+  if (pages.length === 0) return result;
 
-  const content: Anthropic.ContentBlockParam[] = pages.map((p) => ({
-    type: "image",
-    source: { type: "base64", media_type: "image/png", data: p.png.toString("base64") },
-  }));
+  // Each image is preceded by ITS OWN text label naming exactly which codes
+  // to expect on it — sending several unlabeled pages plus one flat code
+  // list at the end let the model blend unrelated customers together
+  // (confirmed on a real production run: codes came back with fabricated,
+  // phonetically-unrelated names, and completely different codes were
+  // returned with near-identical surnames, both signs of the model filling
+  // in a plausible-sounding answer rather than reporting "not found" for a
+  // code whose real match was actually on a different image in the batch).
+  const content: Anthropic.ContentBlockParam[] = [];
+  pages.forEach((p, i) => {
+    content.push({ type: "text", text: `Image ${i + 1} — expected customer codes on THIS image only: ${p.codes.join(", ")}` });
+    content.push({ type: "image", source: { type: "base64", media_type: "image/png", data: p.png.toString("base64") } });
+  });
+  const allCodes = pages.flatMap((p) => p.codes);
   content.push({
     type: "text",
     text:
-      `These are pages from a Thai fuel-sales/customer PDF report. For each of these customer codes, find where it is printed on one of the pages and read the EXACT Thai customer name printed right next to it (include every tone mark and vowel exactly as shown — the source PDF's own embedded text is corrupted for these, so read the visible glyphs, not any text you might otherwise infer).\n\n` +
-      `Codes: ${codes.join(", ")}\n\n` +
-      `Respond with ONLY a JSON object mapping each code you found to its exact Thai name, e.g. {"KCL660012":"ปั๊ม นิมิตรบริการ"}. Omit any code you cannot find on these pages. No other text.`,
+      `Each image above is one page of a Thai fuel-sales/customer PDF report, labeled with the customer codes that are printed somewhere ON THAT SPECIFIC IMAGE. For each code, read the EXACT Thai customer name printed right next to it ON ITS OWN LABELED IMAGE (include every tone mark and vowel exactly as shown — the source PDF's own embedded text is corrupted for these, so read the visible glyphs).\n\n` +
+      `STRICT RULES:\n` +
+      `- Only report a name you can actually see printed next to that exact code on its labeled image.\n` +
+      `- NEVER guess, complete, or invent a name, and NEVER reuse a name you saw for one code on a different code — if you are not confident, omit that code entirely rather than answer it.\n` +
+      `- A code's name never appears on an image that doesn't list it as an expected code.\n\n` +
+      `All codes across every image: ${allCodes.join(", ")}\n\n` +
+      `Respond with ONLY a JSON object mapping each code you actually found to its exact Thai name, e.g. {"KCL660012":"ปั๊ม นิมิตรบริการ"}. Omit any code you could not confidently find. No other text.`,
   });
 
   const msg = await client.messages.create({
     model: MODEL,
-    max_tokens: Math.min(4096, 200 + codes.length * 40),
+    max_tokens: Math.min(4096, 200 + allCodes.length * 40),
     messages: [{ role: "user", content }],
   });
 
@@ -239,10 +258,17 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
       }
       const batch = batches[nextBatch++];
       try {
-        const pages = await Promise.all(batch.map(async (j) => ({ source: j.source, pageNum: j.pageNum, png: await renderPagePng(j.doc, j.pageNum) })));
-        const codes = [...new Set(batch.flatMap((j) => j.codes))];
-        const found = await callClaudeForBatch(client, pages, codes);
-        for (const [code, name] of found) namesByCode.set(code, name);
+        const pages = await Promise.all(
+          batch.map(async (j) => ({ source: j.source, pageNum: j.pageNum, codes: j.codes, png: await renderPagePng(j.doc, j.pageNum) }))
+        );
+        const expectedCodes = new Set(batch.flatMap((j) => j.codes));
+        const found = await callClaudeForBatch(client, pages);
+        for (const [code, name] of found) {
+          // Defense in depth against the labeling prompt still failing on
+          // some response: never accept a code this batch didn't actually
+          // ask about.
+          if (expectedCodes.has(code)) namesByCode.set(code, name);
+        }
       } catch {
         apiErrors++;
         // one bad batch (network hiccup, rate limit, malformed response)
