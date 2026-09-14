@@ -2,8 +2,9 @@ import { DEFAULT_FREIGHT_TIERS } from "@/lib/calc/freightTable";
 import type { BranchConfig } from "./types";
 
 /**
- * สาขากระนวน (สามทอง/โลจิสติกส์) — classified by "เลือกแผนก" (department) in
- * each sales report's own header, not by truck-per-file the way สามทอง's
+ * สาขากระนวน — หจก.เค.ซี.ปิโตรเลียม 2006 (คนละนิติบุคคลกับสามทอง/หจก.สามทองบริการ,
+ * ยืนยันจากผู้ใช้ 14 ก.ย.69) — classified by "เลือกแผนก" (department) in each
+ * sales report's own header, not by truck-per-file the way สามทอง's
  * flat model is. Built from and regression-tested against the branch's own
  * confirmed v2 spec ("# สเปคระบบคำนวณค่าคอมมิชชั่นการตลาด_V2.txt", ยืนยันกับ
  * PDF ต้นทางจริงทีละบรรทัด) and its approved reference workbook ("ค่าคอม KN
@@ -14,7 +15,9 @@ import type { BranchConfig } from "./types";
 export const kranuanBranch: BranchConfig = {
   id: "kranuan",
   label: "กระนวน",
-  companyName: "หจก.สามทองบริการ",
+  // ยืนยันจากผู้ใช้ 14 ก.ย.69 — คนละนิติบุคคลกับสามทอง แม้จะอยู่ในกลุ่มธุรกิจ
+  // เดียวกัน (พบชื่อนี้ตรงกับหัวรายงานขายจริงของกระนวนด้วย: "เค.ซี.ปิโตรเลียม 2006")
+  companyName: "หจก.เค.ซี.ปิโตรเลียม 2006",
 
   periodLabel: "8/69",
   periodLabelThai: "ส.ค. 2569",
