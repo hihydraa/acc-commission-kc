@@ -54,8 +54,12 @@ const MODEL = "claude-haiku-4-5-20251001";
 // the `deadline` check in the page loops below, which this alone doesn't
 // replace.
 const CROP_SCALE = 2;
-const CROPS_PER_REQUEST = 20;
-const REQUEST_CONCURRENCY = 3;
+// TEMP DIAGNOSTIC: 1 crop per request, isolating whether batch size itself
+// is why a real production run (20/request) came back with mostly-wrong
+// names despite the crops themselves being legible on manual inspection —
+// see resolveCustomerNamesViaClaude's module doc once this is resolved.
+const CROPS_PER_REQUEST = 1;
+const REQUEST_CONCURRENCY = 5;
 // Overall wall-clock budget for every Claude call in one pipeline run —
 // leaves headroom under the API route's own maxDuration for PDF parsing,
 // the commission calculation itself, and building the Excel workbook, all
