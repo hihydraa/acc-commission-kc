@@ -25,10 +25,14 @@ function isValidExcludedCustomers(v: unknown): v is ExcludedCustomer[] {
     if (typeof r.customerName !== "string") return false;
     if (typeof r.reason !== "string") return false;
     const code = r.customerCode.trim().toUpperCase();
-    if (codes.has(code)) return false; // no duplicates
+    if (codes.has(code)) return false; // no duplicates within this one list
     codes.add(code);
   }
   return true;
+}
+
+function sanitizeExcludedCustomers(v: ExcludedCustomer[]): ExcludedCustomer[] {
+  return v.map((c) => ({ customerCode: c.customerCode.trim().toUpperCase(), customerName: c.customerName.trim(), reason: c.reason.trim() }));
 }
 
 export async function GET(request: NextRequest) {
@@ -61,7 +65,7 @@ export async function POST(request: NextRequest) {
   } catch {
     return NextResponse.json({ error: "ข้อมูลที่ส่งมาไม่ใช่ JSON ที่ถูกต้อง" }, { status: 400 });
   }
-  const { branchId, excludedCustomers, qty, departmentQty, updatedBy } = (body ?? {}) as Record<string, unknown>;
+  const { branchId, excludedCustomers, qty, departmentExcludedCustomers, departmentQty, updatedBy } = (body ?? {}) as Record<string, unknown>;
 
   if (typeof branchId !== "string") {
     return NextResponse.json({ error: "ไม่ได้ระบุสาขา (branchId)" }, { status: 400 });
@@ -70,12 +74,8 @@ export async function POST(request: NextRequest) {
   if (!branch) {
     return NextResponse.json({ error: `ไม่พบสาขา '${branchId}'` }, { status: 400 });
   }
-  if (!isValidExcludedCustomers(excludedCustomers)) {
-    return NextResponse.json({ error: "รายชื่อลูกค้าที่ยกเว้นไม่ถูกต้อง (ตรวจสอบรหัสลูกค้าซ้ำ หรือช่องว่าง)" }, { status: 400 });
-  }
 
   const override: BranchOverride = {
-    excludedCustomers: excludedCustomers.map((c) => ({ customerCode: c.customerCode.trim().toUpperCase(), customerName: c.customerName.trim(), reason: c.reason.trim() })),
     updatedAt: new Date().toISOString(),
     updatedBy: typeof updatedBy === "string" && updatedBy.trim() ? updatedBy.trim() : undefined,
   };
@@ -83,10 +83,16 @@ export async function POST(request: NextRequest) {
   // A branch can be a hybrid (สามทอง: flat rules for its regular trucks +
   // a departments entry for กรอกหลังปั๊ม) — these are independent, not
   // mutually exclusive, so both get validated/saved when both apply.
+  // Exclusion is channel-scoped too: the flat list only ever applies to
+  // regular trucks, each department has its own separate list.
   if (branch.minQtyLiters !== undefined) {
-    if (!isValidQtyRule(qty)) {
-      return NextResponse.json({ error: "เกณฑ์ปริมาณไม่ถูกต้อง" }, { status: 400 });
+    if (!isValidExcludedCustomers(excludedCustomers)) {
+      return NextResponse.json({ error: "รายชื่อลูกค้าที่ยกเว้น (รถทั่วไป) ไม่ถูกต้อง (ตรวจสอบรหัสลูกค้าซ้ำ หรือช่องว่าง)" }, { status: 400 });
     }
+    if (!isValidQtyRule(qty)) {
+      return NextResponse.json({ error: "เกณฑ์ปริมาณ (รถทั่วไป) ไม่ถูกต้อง" }, { status: 400 });
+    }
+    override.excludedCustomers = sanitizeExcludedCustomers(excludedCustomers);
     override.qty = { minQtyLiters: qty.minQtyLiters, requireExactMultiple: qty.requireExactMultiple, qtyMultipleOf: qty.qtyMultipleOf };
   }
 
@@ -94,14 +100,19 @@ export async function POST(request: NextRequest) {
     if (!departmentQty || typeof departmentQty !== "object") {
       return NextResponse.json({ error: "ไม่ได้ระบุเกณฑ์ปริมาณต่อแผนก (departmentQty)" }, { status: 400 });
     }
+    if (!departmentExcludedCustomers || typeof departmentExcludedCustomers !== "object") {
+      return NextResponse.json({ error: "ไม่ได้ระบุรายชื่อลูกค้าที่ยกเว้นต่อแผนก (departmentExcludedCustomers)" }, { status: 400 });
+    }
     const dq = departmentQty as Record<string, unknown>;
-    const validated: Record<string, QtyRule> = {};
+    const dex = departmentExcludedCustomers as Record<string, unknown>;
+    const validatedQty: Record<string, QtyRule> = {};
+    const validatedExcluded: Record<string, ExcludedCustomer[]> = {};
     for (const dept of branch.departments) {
       const rule = dq[dept.code];
       if (!isValidQtyRule(rule)) {
         return NextResponse.json({ error: `เกณฑ์ปริมาณของแผนก '${dept.label}' (${dept.code}) ไม่ถูกต้อง` }, { status: 400 });
       }
-      validated[dept.code] = {
+      validatedQty[dept.code] = {
         minQtyLiters: rule.minQtyLiters,
         requireExactMultiple: rule.requireExactMultiple,
         qtyMultipleOf: rule.qtyMultipleOf,
@@ -110,8 +121,15 @@ export async function POST(request: NextRequest) {
         // departments even if the client sent one.
         fixedSalesperson: dept.fixedSalesperson !== null ? (typeof rule.fixedSalesperson === "string" ? rule.fixedSalesperson.trim() || null : dept.fixedSalesperson) : null,
       };
+
+      const exRows = dex[dept.code];
+      if (!isValidExcludedCustomers(exRows)) {
+        return NextResponse.json({ error: `รายชื่อลูกค้าที่ยกเว้นของแผนก '${dept.label}' (${dept.code}) ไม่ถูกต้อง` }, { status: 400 });
+      }
+      validatedExcluded[dept.code] = sanitizeExcludedCustomers(exRows);
     }
-    override.departmentQty = validated;
+    override.departmentQty = validatedQty;
+    override.departmentExcludedCustomers = validatedExcluded;
   }
 
   await saveBranchOverride(branchId, override);

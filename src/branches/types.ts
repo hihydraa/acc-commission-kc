@@ -58,6 +58,16 @@ export interface DepartmentConfig {
    *  a delivery route) never appear in the distance/เซลล์ master file at
    *  all, and the whole department is one เซลล์'s alone (ยืนยันจากผู้ใช้). */
   fixedSalesperson: string | null;
+  /** customers excluded from THIS department only — separate from
+   *  BranchConfig.excludedCustomers (the flat/filename-classified scope),
+   *  because the same branch can have a customer excluded in one channel
+   *  but not another. Confirmed with the user (14 ก.ย.69): สามทอง's
+   *  ST57039 (ATA ปิโตรเลียม) is excluded from the regular-truck scope
+   *  specifically (a มิเตอร์-truck driver's customer, unrelated to
+   *  กรอกหลังปั๊ม) — a single shared branch-wide list would have wrongly
+   *  implied it applied to กรอกหลังปั๊ม too, or mislabeled the section as
+   *  "กรอกหลังปั๊ม-only" when it wasn't. */
+  excludedCustomers: ExcludedCustomer[];
 }
 
 export interface BranchConfig {
@@ -122,6 +132,12 @@ export interface BranchConfig {
    *  resolves to gets their commission forced to 0 */
   salespersonRoster: string[];
 
+  /** customers excluded from the branch's FLAT/filename-classified scope
+   *  (regular trucks) — a department (DepartmentConfig.excludedCustomers)
+   *  has its own separate list, since exclusion can genuinely differ by
+   *  channel within the same branch (see that field's comment). For a
+   *  fully department-based branch (กระนวน — no flat scope at all) this
+   *  stays an empty array; it's never used. */
   excludedCustomers: ExcludedCustomer[];
   masterOverrides: MasterOverrideRow[];
 

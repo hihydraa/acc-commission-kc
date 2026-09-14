@@ -16,12 +16,15 @@ import type { BranchConfig, ExcludedCustomer } from "@/branches/types";
  * of persistence that still gives every accounting user on any device the
  * SAME shared settings, which is what was asked for over localStorage.
  *
- * A branch can be a HYBRID of both models — สามทอง has flat qty rules for
- * its regular trucks (filename-classified) AND a "departments" entry for
- * its กรอกหลังปั๊ม channel (classified by the file's own "เลือกแผนก" header) —
- * so `qty` and `departmentQty` are independent, not mutually exclusive:
- * presence is decided by whether the branch has flat fields / a departments
- * array at all, never by which one "wins".
+ * A branch can be a HYBRID of both models — สามทอง has flat qty/exclusion
+ * rules for its regular trucks (filename-classified) AND a "departments"
+ * entry for its กรอกหลังปั๊ม channel (classified by the file's own "เลือกแผนก"
+ * header) — so the flat fields and the department ones below are
+ * independent, not mutually exclusive: presence is decided by whether the
+ * branch has flat fields / a departments array at all, never by which one
+ * "wins". Exclusion in particular is genuinely channel-scoped, not just a
+ * UI grouping — สามทอง's ST57039 applies to its regular trucks only, and a
+ * customer excluded in one department's file has no bearing on another's.
  */
 
 export interface QtyRule {
@@ -35,10 +38,11 @@ export interface QtyRule {
 }
 
 export interface BranchOverride {
-  excludedCustomers: ExcludedCustomer[];
   /** present only for branches with flat minQtyLiters/etc (สามทอง's regular trucks) */
+  excludedCustomers?: ExcludedCustomer[];
   qty?: QtyRule;
-  /** present only for branches with a departments array, keyed by DepartmentConfig.code */
+  /** present only for branches with a departments array, both keyed by DepartmentConfig.code */
+  departmentExcludedCustomers?: Record<string, ExcludedCustomer[]>;
   departmentQty?: Record<string, QtyRule>;
   updatedAt: string;
   updatedBy?: string;
@@ -81,28 +85,37 @@ export async function saveBranchOverride(branchId: string, override: BranchOverr
  *  calculation run — never mutates the imported config object. */
 export function applyBranchOverride(branch: BranchConfig, override: BranchOverride | undefined): BranchConfig {
   if (!override) return branch;
-  const next: BranchConfig = { ...branch, excludedCustomers: override.excludedCustomers ?? branch.excludedCustomers };
+  const next: BranchConfig = { ...branch };
 
-  if (branch.minQtyLiters !== undefined && override.qty) {
-    next.minQtyLiters = override.qty.minQtyLiters;
-    next.requireExactMultiple = override.qty.requireExactMultiple;
-    next.qtyMultipleOf = override.qty.qtyMultipleOf;
+  if (branch.minQtyLiters !== undefined) {
+    if (override.excludedCustomers) next.excludedCustomers = override.excludedCustomers;
+    if (override.qty) {
+      next.minQtyLiters = override.qty.minQtyLiters;
+      next.requireExactMultiple = override.qty.requireExactMultiple;
+      next.qtyMultipleOf = override.qty.qtyMultipleOf;
+    }
   }
 
-  if (branch.departments && override.departmentQty) {
+  if (branch.departments && (override.departmentQty || override.departmentExcludedCustomers)) {
     next.departments = branch.departments.map((d) => {
-      const o = override.departmentQty?.[d.code];
-      if (!o) return d;
+      const q = override.departmentQty?.[d.code];
+      const ex = override.departmentExcludedCustomers?.[d.code];
+      if (!q && !ex) return d;
       return {
         ...d,
-        minQtyLiters: o.minQtyLiters,
-        requireExactMultiple: o.requireExactMultiple,
-        qtyMultipleOf: o.qtyMultipleOf,
-        // Only a department that already has a fixed เซลล์ concept
-        // (fixedSalesperson !== null in the hardcoded config) can have it
-        // overridden — never let a settings payload turn a normal
-        // master-lookup department into a fixed-เซลล์ one or vice versa.
-        fixedSalesperson: d.fixedSalesperson !== null ? (o.fixedSalesperson ?? d.fixedSalesperson) : null,
+        excludedCustomers: ex ?? d.excludedCustomers,
+        ...(q
+          ? {
+              minQtyLiters: q.minQtyLiters,
+              requireExactMultiple: q.requireExactMultiple,
+              qtyMultipleOf: q.qtyMultipleOf,
+              // Only a department that already has a fixed เซลล์ concept
+              // (fixedSalesperson !== null in the hardcoded config) can have
+              // it overridden — never let a settings payload turn a normal
+              // master-lookup department into a fixed-เซลล์ one or vice versa.
+              fixedSalesperson: d.fixedSalesperson !== null ? q.fixedSalesperson ?? d.fixedSalesperson : null,
+            }
+          : {}),
       };
     });
   }
@@ -117,13 +130,16 @@ export function effectiveEditableState(branch: BranchConfig, override: BranchOve
   const hasFlat = branch.minQtyLiters !== undefined;
   const hasDepartments = !!branch.departments;
   return {
-    excludedCustomers: override?.excludedCustomers ?? branch.excludedCustomers,
+    excludedCustomers: hasFlat ? override?.excludedCustomers ?? branch.excludedCustomers : null,
     qty: hasFlat
       ? {
           minQtyLiters: override?.qty?.minQtyLiters ?? branch.minQtyLiters ?? 0,
           requireExactMultiple: override?.qty?.requireExactMultiple ?? branch.requireExactMultiple ?? false,
           qtyMultipleOf: override?.qty?.qtyMultipleOf ?? branch.qtyMultipleOf ?? 1000,
         }
+      : null,
+    departmentExcludedCustomers: hasDepartments
+      ? Object.fromEntries(branch.departments!.map((d) => [d.code, override?.departmentExcludedCustomers?.[d.code] ?? d.excludedCustomers]))
       : null,
     // Merged per-field (not a blind "stored override wins wholesale") so an
     // override saved before `fixedSalesperson` existed still falls back to

@@ -37,9 +37,9 @@ export const kranuanBranch: BranchConfig = {
   // ไม่มี minQtyLiters/requireExactMultiple/qtyMultipleOf แบบ flat — ใช้
   // departments แทน เพราะแต่ละแผนกมีเกณฑ์ปริมาณต่างกัน (สเปค §2.1, §4.1)
   departments: [
-    { code: "A7", label: "เบอร์60", docPrefixes: ["HDA", "IDA"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null },
-    { code: "B7", label: "เบอร์67", docPrefixes: ["HDB", "IDB"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null },
-    { code: "68", label: "เทรลเลอร์68", docPrefixes: ["HD", "ID"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null },
+    { code: "A7", label: "เบอร์60", docPrefixes: ["HDA", "IDA"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null, excludedCustomers: [] },
+    { code: "B7", label: "เบอร์67", docPrefixes: ["HDB", "IDB"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null, excludedCustomers: [] },
+    { code: "68", label: "เทรลเลอร์68", docPrefixes: ["HD", "ID"], minQtyLiters: 2000, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: null, fixedSalesperson: null, excludedCustomers: [] },
     // กรอกหลังปั๊ม: ลูกค้าเติมที่หน้าปั๊มโดยตรง ไม่ได้อยู่ในเส้นทางรถส่ง จึงไม่มีใน
     // ไฟล์ master ระยะทาง/เซลล์เลย — ทั้งแผนกเป็นของเซลล์ "อ้อม" คนเดียวเสมอ
     // (ยืนยันจากผู้ใช้ 11 ก.ย.69 หลังตรวจสอบกับไฟล์อ้างอิงที่ทุกแถวเป็นอ้อม)
@@ -51,7 +51,31 @@ export const kranuanBranch: BranchConfig = {
     // จริงเดือน 8/69 มี 46 ลูกค้า รวม 146,221.52 ล. แต่มีแค่ 3 ลูกค้าที่เคยเติม
     // เกิน 1,000 ล./ครั้ง — เกณฑ์ 1,000 ล. เดิมตัดลูกค้าอีก 43 รายทิ้งไปทั้งหมด
     // คิดเป็น 108,124.33 ล. ที่หายไปจากยอดที่ควรนับ)
-    { code: "B3", label: "กรอกหลังปั๊ม", docPrefixes: ["HSB", "IVB", "IV"], minQtyLiters: 0, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: 0.1, fixedSalesperson: "อ้อม" },
+    //
+    // excludedCustomers: "สด /KNDC0018" เป็นลูกค้าบัตรเติมน้ำมันรายวัน คนละ
+    // ประเภทลูกค้ากับลูกค้าเซลล์การตลาด (ยืนยันจากไฟล์อ้างอิงที่ผู้ใช้ส่งมา +
+    // สเปค §4.1/§8 — ทำให้เสียค่าคอม 63.81 บาท/เดือน ซึ่งเป็นนโยบายที่ตั้งใจ
+    // ไม่ใช่บั๊ก) KNDC2075 "คิวอาร์โค้ด" และ KNDC2151 "โอนบัญชีกสิกรไทย
+    // 454-2-13867-5" เป็นรหัสวิธีชำระเงิน ไม่ใช่ลูกค้าจริง (ยืนยันจากผู้ใช้
+    // 14 ก.ย.69 — ต่างจากรหัส "KNDC" อื่นๆ ที่มีคำว่า "สะสมคะแนน" ต่อท้ายชื่อ
+    // ซึ่งผู้ใช้ยืนยันให้นับรวมเพราะเป็นลูกค้าจริงที่ใช้บัตรสะสมแต้ม) — ทั้ง 3
+    // รหัสนี้เป็นข้อมูลเฉพาะช่องทางกรอกหลังปั๊ม กระนวนไม่มีรถทั่วไปให้ตัดออกที่ใด
+    // เลยในสาขานี้ (ไม่เหมือนสามทองที่มี ST57039 อยู่ในสโคปรถทั่วไป)
+    {
+      code: "B3",
+      label: "กรอกหลังปั๊ม",
+      docPrefixes: ["HSB", "IVB", "IV"],
+      minQtyLiters: 0,
+      requireExactMultiple: false,
+      qtyMultipleOf: 1000,
+      fixedFreightRate: 0.1,
+      fixedSalesperson: "อ้อม",
+      excludedCustomers: [
+        { customerCode: "KNDC0018", customerName: "สด (บัตรเติมน้ำมันรายวัน)", reason: "ลูกค้าบัตรเติมน้ำมันรายวัน คนละประเภทลูกค้ากับลูกค้าเซลล์การตลาด" },
+        { customerCode: "KNDC2075", customerName: "คิวอาร์โค้ด", reason: "รหัสวิธีชำระเงิน (QR code) ไม่ใช่ลูกค้าจริง" },
+        { customerCode: "KNDC2151", customerName: "โอนบัญชีกสิกรไทย 454-2-13867-5", reason: "รหัสวิธีชำระเงิน (โอนบัญชีธนาคาร) ไม่ใช่ลูกค้าจริง" },
+      ],
+    },
   ],
 
   docPrefixToSaleType: { H: "cash", I: "credit" },
@@ -75,19 +99,9 @@ export const kranuanBranch: BranchConfig = {
 
   salespersonRoster: ["อ้อม", "ต้อม", "วีระ"],
 
-  // "สด /KNDC0018" — ลูกค้าบัตรเติมน้ำมันรายวัน คนละประเภทลูกค้ากับลูกค้า
-  // เซลล์การตลาด (ยืนยันจากไฟล์อ้างอิงที่ผู้ใช้ส่งมา + สเปค §4.1/§8 — ทำให้เสีย
-  // ค่าคอม 63.81 บาท/เดือน ซึ่งเป็นนโยบายที่ตั้งใจ ไม่ใช่บั๊ก)
-  //
-  // KNDC2075 "คิวอาร์โค้ด" และ KNDC2151 "โอนบัญชีกสิกรไทย 454-2-13867-5" —
-  // รหัสวิธีชำระเงิน ไม่ใช่ลูกค้าจริง (ยืนยันจากผู้ใช้ 14 ก.ย.69 — ต่างจากรหัส
-  // "KNDC" อื่นๆ ที่มีคำว่า "สะสมคะแนน" ต่อท้ายชื่อ ซึ่งผู้ใช้ยืนยันให้นับรวมเพราะ
-  // เป็นลูกค้าจริงที่ใช้บัตรสะสมแต้ม แค่สองรหัสนี้เท่านั้นที่เป็นรหัสวิธีจ่ายเงินล้วนๆ)
-  excludedCustomers: [
-    { customerCode: "KNDC0018", customerName: "สด (บัตรเติมน้ำมันรายวัน)", reason: "ลูกค้าบัตรเติมน้ำมันรายวัน คนละประเภทลูกค้ากับลูกค้าเซลล์การตลาด" },
-    { customerCode: "KNDC2075", customerName: "คิวอาร์โค้ด", reason: "รหัสวิธีชำระเงิน (QR code) ไม่ใช่ลูกค้าจริง" },
-    { customerCode: "KNDC2151", customerName: "โอนบัญชีกสิกรไทย 454-2-13867-5", reason: "รหัสวิธีชำระเงิน (โอนบัญชีธนาคาร) ไม่ใช่ลูกค้าจริง" },
-  ],
+  // กระนวนไม่มีสโคปรถทั่วไปแบบสามทอง (ทุกไฟล์จัดประเภทด้วย "เลือกแผนก" เสมอ) —
+  // รายการยกเว้นทั้งหมดของสาขานี้อยู่ในระดับแผนก B3 (กรอกหลังปั๊ม) ด้านบนแทน
+  excludedCustomers: [],
 
   // ยังไม่พบลูกค้าที่ต้องเพิ่มเองนอกไฟล์ master ในรอบตรวจสอบครั้งนี้ — ถ้าเดือน
   // ถัดไปมีลูกค้าใหม่ที่ไม่มีใน master ให้ยืนยันกับผู้ใช้ก่อนเพิ่มที่นี่ (ห้ามเดา)

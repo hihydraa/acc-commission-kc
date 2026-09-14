@@ -68,21 +68,16 @@ function buildMasterEntries(
 ): Map<string, MasterEntry> {
   const byCode = new Map<string, MasterEntry>();
 
-  // 1. excluded customers take priority over anything else — their เซลล์
-  // cell is set to a plainly non-roster descriptive label so the workbook's
-  // roster check zeroes their commission no matter what any master file
-  // says, matching the approved reference's own convention.
-  for (const ex of branch.excludedCustomers) {
-    byCode.set(ex.customerCode, {
-      customerName: `${ex.customerName} (ตัดออก)`,
-      distanceKm: null,
-      salesperson: `ตัดออก - ไม่คิดค่าคอมการตลาด (${ex.reason})`,
-      tag: "",
-      sourceText: `${ex.reason} - ไม่นับค่าคอมการตลาด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`,
-    });
-  }
+  // Exclusion is NOT handled here — it's channel-scoped (a department's own
+  // excludedCustomers vs the branch's flat one) and resolved per-transaction
+  // in the main loop below, where the current line's department is known.
+  // A single shared map keyed only by customerCode can't safely hold
+  // exclusion status: the same code could in principle be excluded in one
+  // department's context but not another's, and seeding it here (as this
+  // function used to) would leak whichever context ran first onto every
+  // other one sharing the code.
 
-  // 2. the uploaded master file's own rows — one row per customer code,
+  // 1. the uploaded master file's own rows — one row per customer code,
   // first occurrence wins if the source PDF lists the same customer more
   // than once for different products (their distance is normally identical
   // per the SKILL's own reuse rule; a genuine conflict is rare enough that
@@ -98,7 +93,7 @@ function buildMasterEntries(
     });
   }
 
-  // 3. branch.masterOverrides fills any customer still missing entirely.
+  // 2. branch.masterOverrides fills any customer still missing entirely.
   for (const ov of branch.masterOverrides) {
     if (byCode.has(ov.customerCode)) continue;
     const sourceText = ov.reuseFromCustomerCode
@@ -174,6 +169,12 @@ export async function runCommissionPipeline(
   // So the sales reports are the authoritative source for ชื่อลูกค้า in the
   // Master sheet too, not the master file's own (unreliable) name guess.
   const customerNameByCode = new Map<string, string>();
+  // Excluded-customer entries, for the Master sheet's own display only —
+  // resolved fresh per transaction below (channel-scoped, never cached
+  // across departments), collected here so they still show up on the
+  // Master sheet with their "ตัดออก" label even though `masterByCode` no
+  // longer carries exclusion status itself.
+  const excludedEntriesSeen = new Map<string, MasterEntry>();
 
   for (const file of salesFiles) {
     const text = await extractPdfText(file.buffer);
@@ -285,10 +286,31 @@ export async function runCommissionPipeline(
         };
         masterByCode.set(line.customerCode, master);
       }
-      const distanceKm = master?.distanceKm ?? null;
-      const salesperson = master?.salesperson ?? null;
-      const freightForcedZero = master?.tag === "1สาย1สู้" || master?.tag === "ทางผ่าน";
-      const masterFound = master !== null;
+
+      // Exclusion is channel-scoped: the current line's department has its
+      // own excludedCustomers list if it belongs to one, otherwise the
+      // branch's flat/regular-truck list applies — never the other way
+      // round (see DepartmentConfig.excludedCustomers comment for why a
+      // single shared list would be wrong, e.g. สามทอง's ST57039 applies to
+      // regular trucks only, not กรอกหลังปั๊ม). Resolved fresh every line,
+      // not cached on `master`/`masterByCode`, so the same customer code
+      // can never leak an exclusion decided in one department's context
+      // into another's.
+      const exclusion = (department?.excludedCustomers ?? branch.excludedCustomers).find((e) => e.customerCode === line.customerCode) ?? null;
+      if (exclusion && !excludedEntriesSeen.has(line.customerCode)) {
+        excludedEntriesSeen.set(line.customerCode, {
+          customerName: `${exclusion.customerName} (ตัดออก)`,
+          distanceKm: null,
+          salesperson: `ตัดออก - ไม่คิดค่าคอมการตลาด (${exclusion.reason})`,
+          tag: "",
+          sourceText: `${exclusion.reason} - ไม่นับค่าคอมการตลาด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`,
+        });
+      }
+
+      const distanceKm = exclusion ? null : master?.distanceKm ?? null;
+      const salesperson = exclusion ? `ตัดออก - ไม่คิดค่าคอมการตลาด (${exclusion.reason})` : master?.salesperson ?? null;
+      const freightForcedZero = !exclusion && (master?.tag === "1สาย1สู้" || master?.tag === "ทางผ่าน");
+      const masterFound = exclusion !== null || master !== null;
 
       const calc: TransactionCalcResult = calculateTransaction(
         {
@@ -422,9 +444,15 @@ export async function runCommissionPipeline(
     }
   }
 
-  const excludedCodes = new Set(branch.excludedCustomers.map((ex) => ex.customerCode));
+  // excludedEntriesSeen wins over masterByCode for any code seen in both
+  // (mirrors the old priority-1 behavior when exclusion still lived inside
+  // buildMasterEntries) — only customers actually encountered as excluded
+  // in THIS run appear here, which is more precise than the old static
+  // branch-level list for deciding the Master sheet's exclusion styling.
+  const combinedMasterEntries = new Map<string, MasterEntry>([...masterByCode, ...excludedEntriesSeen]);
+  const excludedCodes = new Set(excludedEntriesSeen.keys());
   const overrideCodes = new Set(branch.masterOverrides.map((ov) => ov.customerCode));
-  const masterRows: MasterSheetRow[] = [...masterByCode.entries()].map(([customerCode, e]) => ({
+  const masterRows: MasterSheetRow[] = [...combinedMasterEntries.entries()].map(([customerCode, e]) => ({
     customerCode,
     // Priority for the Master sheet's display name:
     //  - excluded customers keep their crafted exclusion label as-is.

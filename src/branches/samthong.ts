@@ -38,7 +38,12 @@ export const samthongBranch: BranchConfig = {
   // เป็น "จุ่น" (ยืนยันจากผู้ใช้ 14 ก.ย.69) แก้ไขได้ที่หน้า /settings
   // docPrefixes เป็นการเดาจากรูปแบบของกระนวน (HSB/IVB/IV) ยังไม่ยืนยัน — ผิดก็แค่
   // ขึ้นเตือน ไม่ block การคำนวณ
-  departments: [{ code: "B3", label: "กรอกหลังปั๊ม", docPrefixes: ["HSB", "IVB", "IV"], minQtyLiters: 0, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: 0.1, fixedSalesperson: "จุ่น" }],
+  // excludedCustomers ว่างไว้ก่อนตามที่ผู้ใช้ยืนยัน (14 ก.ย.69) — ยังไม่มีไฟล์
+  // กรอกหลังปั๊มจริงของสามทองให้ตรวจสอบว่ามีลูกค้ากลุ่มพิเศษ (บัตรเครดิต/คิวอาร์
+  // โค้ด/ฯลฯ แบบที่พบในกระนวน) หรือไม่ — แยกจาก branch-level excludedCustomers
+  // (ST57039) ด้านล่างโดยเจตนา เพราะ ST57039 เป็นการยกเว้นของสโคปรถทั่วไป
+  // (ลูกค้ารถมิเตอร์) ไม่เกี่ยวกับกรอกหลังปั๊มเลย
+  departments: [{ code: "B3", label: "กรอกหลังปั๊ม", docPrefixes: ["HSB", "IVB", "IV"], minQtyLiters: 0, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: 0.1, fixedSalesperson: "จุ่น", excludedCustomers: [] }],
 
   docPrefixToSaleType: { H: "cash", I: "credit" },
 

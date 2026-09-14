@@ -102,6 +102,21 @@ function productLabel(code: string): string {
   return PRODUCT_NAME_BY_CODE[code] ?? code;
 }
 
+/** A branch can be a hybrid (สามทอง: flat rules for regular trucks + a
+ *  departments entry for กรอกหลังปั๊ม) — these two pieces are independent,
+ *  not mutually exclusive, so both must be described when both are present
+ *  or a summary line would silently omit the regular-truck rule entirely. */
+function qtyRuleDescription(branch: BranchConfig): string {
+  const parts: string[] = [];
+  if (branch.minQtyLiters !== undefined) {
+    parts.push(`รถทั่วไป>=${branch.minQtyLiters.toLocaleString()}ล.${branch.requireExactMultiple ? "(ลงท้ายพันพอดี)" : ""}`);
+  }
+  if (branch.departments) {
+    parts.push(...branch.departments.map((d) => `${d.label}>=${d.minQtyLiters.toLocaleString()}ล.`));
+  }
+  return parts.join(", ");
+}
+
 function toThaiDateDisplay(ddmmyy: string): string {
   const m = ddmmyy.match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
   if (!m) return ddmmyy;
@@ -222,7 +237,12 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   masterSheet.addRow(["รหัสลูกค้า", "เซลล์", "ระยะทาง(กม.)", "Tag", "ชื่อลูกค้า", "ที่มา"]);
   masterSheet.getRow(1).font = { bold: true };
   for (const m of input.masterRows) {
-    const isExcluded = branch.excludedCustomers.some((e) => e.customerCode === m.customerCode);
+    // Exclusion is channel-scoped now (branch-flat vs per-department — see
+    // DepartmentConfig.excludedCustomers), so `masterRows` itself already
+    // carries the right salesperson label for whichever list actually
+    // matched; detect it from that instead of re-checking one specific
+    // list here.
+    const isExcluded = m.salesperson.startsWith("ตัดออก");
     const isUserConfirmed = m.sourceText.startsWith("ยืนยันจากผู้ใช้");
     const row = masterSheet.addRow([m.customerCode, m.salesperson, m.distanceKm, m.tag, m.customerName, m.sourceText]);
     if (isExcluded) row.eachCell((c) => (c.fill = EXCLUDE_FILL));
@@ -399,9 +419,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
 
   // ---------- ค่าคอมรวม ----------
   const summarySheet = workbook.addWorksheet(safeSheetName("ค่าคอมรวม", usedSheetNames));
-  const qtyColumnLabel = branch.departments
-    ? `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ตามเกณฑ์ปริมาณของแต่ละแผนก ทุกชนิดน้ำมัน — ${branch.departments.map((d) => `${d.label}≥${d.minQtyLiters.toLocaleString()}ล.`).join(", ")})`
-    : `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ >=${(branch.minQtyLiters ?? 0).toLocaleString()}L${branch.requireExactMultiple ? " และลงท้ายพันพอดี" : ""} ทุกชนิดน้ำมัน)`;
+  const qtyColumnLabel = `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ ทุกชนิดน้ำมัน — ${qtyRuleDescription(branch)})`;
   const debtColumnLabel =
     branch.debtDeductionMode === "auto"
       ? "หักค่าคอมจากหนี้ค้างชำระ"
@@ -467,12 +485,14 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   coverSheet.mergeCells(1, 1, 1, branch.teamSplit.roles.length + 2);
   coverSheet.getCell("A1").value = `สรุปค่าคอมมิชชั่นฝ่ายการตลาด สาขา${branch.label} - เดือน ${branch.periodLabel} (${branch.periodLabelThai})`;
   coverSheet.getRow(1).font = { bold: true, size: 13 };
-  const qtyRuleLabel = branch.departments
-    ? branch.departments.map((d) => `${d.label}>=${d.minQtyLiters.toLocaleString()}ล.`).join(", ")
-    : `>=${(branch.minQtyLiters ?? 0).toLocaleString()} ลิตร${branch.requireExactMultiple ? " และลงท้ายพันพอดี" : ""}`;
+  // Every exclusion list that could apply anywhere in this branch — the
+  // flat/regular-truck one plus every department's own (see
+  // DepartmentConfig.excludedCustomers) — just for this one summary line;
+  // the actual per-row exclusion check elsewhere is properly channel-scoped.
+  const allExcludedCustomers = [...branch.excludedCustomers, ...(branch.departments?.flatMap((d) => d.excludedCustomers) ?? [])];
   coverSheet.mergeCells(3, 1, 3, branch.teamSplit.roles.length + 2);
   coverSheet.getCell("A3").value =
-    `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${branch.fuelProductCodes.map(productLabel).join("+")} ที่ ${qtyRuleLabel} | ไม่รวมลูกค้า${branch.excludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
+    `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${[...new Set(branch.fuelProductCodes.map(productLabel))].join("+")} ที่ ${qtyRuleDescription(branch)} | ไม่รวมลูกค้า${allExcludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
   coverSheet.getRow(3).font = { italic: true };
 
   const splitHeaderRow = 5;
@@ -550,25 +570,34 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   blank();
 
   addLine("2) เกณฑ์การกรองรายการที่เข้าเกณฑ์ค่าคอม");
-  addLine(`- รวมน้ำมันใสทุกชนิด: ${branch.fuelProductCodes.map(productLabel).join(", ")}`);
-  if (branch.departments) {
-    addLine("- ปริมาณขายสุทธิต้อง >= เกณฑ์ขั้นต่ำของแต่ละแผนก ต่อ 1 เอกสาร (ไม่มีเงื่อนไขต้องลงท้ายพันพอดี):");
-    for (const d of branch.departments) {
-      addLine(`    ${d.label} (${d.code}): >= ${d.minQtyLiters.toLocaleString()} ลิตร${d.fixedFreightRate !== null ? ` · ค่าขนส่ง/ลิตร คงที่ ${d.fixedFreightRate} บาท` : ""}`);
-    }
-  } else {
+  addLine(`- รวมน้ำมันใสทุกชนิด: ${[...new Set(branch.fuelProductCodes.map(productLabel))].join(", ")}`);
+  if (branch.minQtyLiters !== undefined) {
     addLine(
-      `- ปริมาณขายสุทธิต้อง >= ${(branch.minQtyLiters ?? 0).toLocaleString()} ลิตร ต่อ 1 เอกสาร${branch.requireExactMultiple ? ` 'และ' ต้องลงท้ายพันพอดี (หาร ${(branch.qtyMultipleOf ?? 0).toLocaleString()} ลงตัว) — เช่น 2,000/3,000/4,000 เข้าเกณฑ์ แต่ 2,500 ไม่เข้าเกณฑ์เลยทั้งบิล` : ""}`
+      `- รถทั่วไป: ปริมาณขายสุทธิต้อง >= ${branch.minQtyLiters.toLocaleString()} ลิตร ต่อ 1 เอกสาร${branch.requireExactMultiple ? ` 'และ' ต้องลงท้ายพันพอดี (หาร ${(branch.qtyMultipleOf ?? 0).toLocaleString()} ลงตัว) — เช่น 2,000/3,000/4,000 เข้าเกณฑ์ แต่ 2,500 ไม่เข้าเกณฑ์เลยทั้งบิล` : ""}`
     );
+  }
+  if (branch.departments) {
+    addLine("- แยกตามแผนก (จัดประเภทจาก \"เลือกแผนก\" ในไฟล์ ไม่ใช่ชื่อไฟล์) ปริมาณขายสุทธิต้อง >= เกณฑ์ขั้นต่ำของแผนกนั้น ต่อ 1 เอกสาร (ไม่มีเงื่อนไขต้องลงท้ายพันพอดี):");
+    for (const d of branch.departments) {
+      addLine(`    ${d.label} (${d.code}): >= ${d.minQtyLiters.toLocaleString()} ลิตร${d.fixedFreightRate !== null ? ` · ค่าขนส่ง/ลิตร คงที่ ${d.fixedFreightRate} บาท` : ""}${d.fixedSalesperson ? ` · เซลล์คงที่ "${d.fixedSalesperson}"` : ""}`);
+    }
   }
   addLine("- ชีทรถแต่ละคันแสดงทุกแถวของทุกชนิดสินค้า (รวมแถวที่ไม่เข้าเกณฑ์ไว้เพื่อการตรวจสอบ) — คอลัมน์ 'ค่าคอม' เป็น 0 อัตโนมัติถ้าไม่เข้าเกณฑ์");
   addLine("- ไม่ได้ตรวจการรวมบิลย่อยที่ต่ำกว่าเกณฑ์ของลูกค้ารายเดียวกันในวันเดียวกัน หากพบควรให้ผู้ใช้ยืนยันก่อนรวมบิล");
   blank();
 
   addLine("3) ลูกค้าที่ตัดออกจากค่าคอมการตลาด");
-  if (branch.excludedCustomers.length === 0) addLine("- ไม่มี");
-  for (const e of branch.excludedCustomers) {
-    addLine(`- ${e.customerCode} ${e.customerName} — ${e.reason} จึงตัดออกทั้งหมด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`);
+  // Exclusion is channel-scoped (branch-flat for รถทั่วไป vs each
+  // department's own list — see DepartmentConfig.excludedCustomers), so
+  // each entry is labeled with which channel it applies to rather than
+  // implying a single branch-wide list.
+  const scopedExclusions = [
+    ...branch.excludedCustomers.map((e) => ({ ...e, scope: "รถทั่วไป" })),
+    ...(branch.departments?.flatMap((d) => d.excludedCustomers.map((e) => ({ ...e, scope: d.label }))) ?? []),
+  ];
+  if (scopedExclusions.length === 0) addLine("- ไม่มี");
+  for (const e of scopedExclusions) {
+    addLine(`- [${e.scope}] ${e.customerCode} ${e.customerName} — ${e.reason} จึงตัดออกทั้งหมด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`);
   }
   const meterAnnotated = [...new Map(input.rows.filter((r) => r.meterAnnotation && r.calc.qualifiesByQty).map((r) => [r.customerCode, r])).values()];
   for (const r of meterAnnotated) {
