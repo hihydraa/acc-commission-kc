@@ -75,11 +75,17 @@ export const samthongBranch: BranchConfig = {
     { customerCode: "ST57220", customerName: "แขวงทางหลวงชนบทกาฬสินธุ์", distanceKm: 20, salesperson: "จุ่น", reuseFromCustomerCode: "ST579612" },
   ],
 
+  // Labels match the approved reference workbook (คำนวณค่าคอม_ST_8.69_3.xlsx)
+  // exactly — "เจ้าหน้าที่การตลาด(เจ้าของยอด)" has no space before the
+  // parenthesis and "ADMIN" has no parenthetical role description, both
+  // unlike กระนวน's own independently-confirmed spec wording (§4.6) — these
+  // two branches' labels are allowed to differ; don't "fix" one to match
+  // the other.
   teamSplit: {
     roles: [
       { key: "manager", label: "ผู้จัดการ เค.ซี.ปิโตรเลียม", percent: 0.1 },
-      { key: "sales", label: "เจ้าหน้าที่การตลาด (เจ้าของยอด)", percent: 0.6, isRemainder: true },
-      { key: "admin", label: "ADMIN (บัญชีสาขา,ธุรการ,คลังน้ำมัน)", percent: 0.2 },
+      { key: "sales", label: "เจ้าหน้าที่การตลาด(เจ้าของยอด)", percent: 0.6, isRemainder: true },
+      { key: "admin", label: "ADMIN", percent: 0.2 },
       { key: "central", label: "ส่วนกลางการตลาด", percent: 0.1 },
     ],
   },

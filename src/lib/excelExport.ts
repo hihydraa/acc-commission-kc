@@ -105,23 +105,31 @@ function productLabel(code: string): string {
 /** A branch can be a hybrid (สามทอง: flat rules for regular trucks + a
  *  departments entry for กรอกหลังปั๊ม) — these two pieces are independent,
  *  not mutually exclusive, so both must be described when both are present
- *  or a summary line would silently omit the regular-truck rule entirely. */
-function qtyRuleDescription(branch: BranchConfig): string {
+ *  or a summary line would silently omit the regular-truck rule entirely.
+ *  The flat-only phrasing matches the approved reference workbook's own
+ *  wording exactly — a branch with no departments at all (a plain flat
+ *  model) produces the identical string it always did. The reference uses
+ *  "L" in the ค่าคอมรวม header but "ลิตร" in the ใบปะหน้า note for the same
+ *  rule — an inconsistency in the approved file itself, not a typo to
+ *  "fix" — so the unit word is a parameter, not hardcoded. */
+function qtyRuleDescription(branch: BranchConfig, unit: "L" | "ลิตร"): string {
   const parts: string[] = [];
   if (branch.minQtyLiters !== undefined) {
-    parts.push(`รถทั่วไป>=${branch.minQtyLiters.toLocaleString()}ล.${branch.requireExactMultiple ? "(ลงท้ายพันพอดี)" : ""}`);
+    parts.push(`>=${branch.minQtyLiters.toLocaleString()}${unit}${branch.requireExactMultiple ? " และลงท้ายพันพอดี" : ""}`);
   }
   if (branch.departments) {
-    parts.push(...branch.departments.map((d) => `${d.label}>=${d.minQtyLiters.toLocaleString()}ล.`));
+    parts.push(...branch.departments.map((d) => `${d.label} >=${d.minQtyLiters.toLocaleString()}${unit}`));
   }
-  return parts.join(", ");
+  return parts.join(" | ");
 }
 
+// Passes the date through exactly as the source PDF prints it
+// (dd/mm/yy, 2-digit Buddhist year) — matches the approved reference
+// workbook's own display ("19/08/69", not "19/08/2569"); expanding to a
+// 4-digit year was a later, unrequested change that drifted from that
+// approved format.
 function toThaiDateDisplay(ddmmyy: string): string {
-  const m = ddmmyy.match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
-  if (!m) return ddmmyy;
-  const yearBE = 2500 + parseInt(m[3], 10);
-  return `${m[1]}/${m[2]}/${yearBE}`;
+  return ddmmyy;
 }
 
 /**
@@ -208,16 +216,20 @@ function commissionFormula(r: number, branch: BranchConfig, scope: SheetScope): 
   const qtyGate = scope.requireExactMultiple
     ? `OR(I${r}<${scope.minQtyLiters},MOD(I${r},${scope.qtyMultipleOf})<>0)`
     : `I${r}<${scope.minQtyLiters}`;
-  return (
-    `IF(M${r}="${BLOCK_SENTINEL}","${BLOCK_SENTINEL}",` +
+  const base =
     `IFERROR(IF(OR(I${r}="",R${r}=""),0,` +
     `IF(${qtyGate},0,` +
     `IF(AND(${rosterCheck}),0,` +
     `${tier("ขายสด", branch.thresholds.cash)},` +
     `${tier("ขายเชื่อ", branch.thresholds.credit)},` +
     `${tier("ลูกหนี้ค้างชำระ", branch.thresholds.overdue)},` +
-    `"ตรวจสอบประเภท(R)")))))),0))`
-  );
+    `"ตรวจสอบประเภท(R)")))))),0)`;
+  // The M-column block check only matters for a "block" branch (กระนวน) —
+  // สามทอง's M never produces that sentinel (freightMissingBehavior:
+  // "defaultZero"), so wrapping its formula in a check that can never
+  // trigger would just be needless noise next to the approved reference
+  // workbook's own (shorter) formula text.
+  return branch.freightMissingBehavior === "block" ? `IF(M${r}="${BLOCK_SENTINEL}","${BLOCK_SENTINEL}",${base})` : base;
 }
 
 const HIGHLIGHT_FILL: ExcelJS.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
@@ -341,8 +353,15 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     sheet.getColumn(21).width = 42;
   }
 
-  // ---------- หักหนี้ค้างชำระ ----------
+  // Sheet objects are created here, in this order, purely to fix the tab
+  // order to match the approved reference workbook (ค่าคอมรวม before
+  // หักหนี้ค้างชำระ) — each sheet's own cells are still filled in below in
+  // whichever order is convenient; ExcelJS's tab order follows
+  // addWorksheet() call order, not when cells get populated afterward.
+  const summarySheet = workbook.addWorksheet(safeSheetName("ค่าคอมรวม", usedSheetNames));
   const debtSheet = workbook.addWorksheet(safeSheetName("หักหนี้ค้างชำระ", usedSheetNames));
+
+  // ---------- หักหนี้ค้างชำระ ----------
   debtSheet.mergeCells(1, 1, 1, 9);
   debtSheet.getCell("A1").value =
     branch.debtDeductionMode === "auto"
@@ -418,8 +437,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   debtSheet.getColumn(1).width = 90;
 
   // ---------- ค่าคอมรวม ----------
-  const summarySheet = workbook.addWorksheet(safeSheetName("ค่าคอมรวม", usedSheetNames));
-  const qtyColumnLabel = `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ ทุกชนิดน้ำมัน — ${qtyRuleDescription(branch)})`;
+  const qtyColumnLabel = `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ ${qtyRuleDescription(branch, "L")} ทุกชนิดน้ำมัน)`;
   const debtColumnLabel =
     branch.debtDeductionMode === "auto"
       ? "หักค่าคอมจากหนี้ค้างชำระ"
@@ -492,7 +510,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   const allExcludedCustomers = [...branch.excludedCustomers, ...(branch.departments?.flatMap((d) => d.excludedCustomers) ?? [])];
   coverSheet.mergeCells(3, 1, 3, branch.teamSplit.roles.length + 2);
   coverSheet.getCell("A3").value =
-    `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${[...new Set(branch.fuelProductCodes.map(productLabel))].join("+")} ที่ ${qtyRuleDescription(branch)} | ไม่รวมลูกค้า${allExcludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
+    `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${[...new Set(branch.fuelProductCodes.map(productLabel))].join("+")} ที่ ${qtyRuleDescription(branch, "ลิตร")} | ไม่รวมลูกค้า${allExcludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
   coverSheet.getRow(3).font = { italic: true };
 
   const splitHeaderRow = 5;

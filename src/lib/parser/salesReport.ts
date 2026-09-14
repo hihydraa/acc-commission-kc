@@ -24,13 +24,19 @@ const CODE_SUFFIX_RE = /^(.+?)\s*\/\s*(\S+)/;
  * Distinguishes a customer header ("ปั๊มxxx /KCL660037") from a product
  * header ("ดีเซล B7 /DS") by the CODE'S SHAPE, not indentation — indentation
  * is not reliable across every PDF extraction path (pdf.js can collapse
- * repeated whitespace on some files). Customer codes are 2-5 letters
+ * repeated whitespace on some files). Customer codes are 1-5 letters
  * immediately followed by 4+ digits with nothing after (KCL680214,
- * ST600136). No product code in this report matches that shape — they're
- * short mixed letter/digit tokens (DS, G91, G95, B7) with too few trailing
- * digits.
+ * ST600136, and confirmed against a real row this missed: "คุณอำนาจ
+ * วิเศษปัสสา (ครอบครัวKC) /B4009" — a single-letter-prefixed code, which the
+ * original {2,5} minimum wrongly rejected, misreading the whole line as a
+ * PRODUCT header instead and silently dropping the customer's display name
+ * — the sale line's own qty/value were unaffected since those come from
+ * the sale line itself, not this header, so no earlier checksum caught it).
+ * No product code in this report matches the 1-5-letters-then-4+-digits
+ * shape either way — they're short mixed letter/digit tokens (DS, G91,
+ * G95, B7) with too few trailing digits.
  */
-const CUSTOMER_CODE_RE = /^[A-Za-z]{2,5}\d{4,}$/;
+const CUSTOMER_CODE_RE = /^[A-Za-z]{1,5}\d{4,}$/;
 
 const SKIP_LINE_MARKERS = [
   "หน้า",
