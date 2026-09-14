@@ -31,8 +31,10 @@ export const samthongBranch: BranchConfig = {
   requireExactMultiple: true,
   qtyMultipleOf: 1000,
 
-  // กรอกหลังปั๊ม (B3) — สามทองมีช่องทางนี้เหมือนกัน แต่เดือนอ้างอิง ST_8.69 ไม่มี
-  // ไฟล์แนบมา (ยืนยันจากผู้ใช้ 14 ก.ย.69) จึงยังไม่เคยตรวจกับข้อมูลจริงเลย —
+  // กรอกหลังปั๊ม — สามทองมีช่องทางนี้เหมือนกัน แต่เดือนอ้างอิง ST_8.69 ไม่มีไฟล์
+  // แนบมา (ยืนยันจากผู้ใช้ 14 ก.ย.69) จึงยังไม่เคยตรวจกับข้อมูลจริงเลย — รหัสแผนก
+  // ("เลือกแผนก" ในไฟล์) คือ "B4" ของสามทอง ไม่ใช่ "B3" แบบกระนวน (ยืนยันจากผู้ใช้
+  // 14 ก.ย.69 — คนละรหัสกันแม้จะเป็นช่องทางเดียวกัน อย่าเข้าใจผิดว่าต้องเหมือนกัน)
   // เงื่อนไข (ค่าขนส่งคงที่ 0.10, ไม่มีเกณฑ์ปริมาณขั้นต่ำ) อิงตามกระนวนตามที่
   // ผู้ใช้ยืนยันให้ใช้เหมือนกัน ("ใช้เงื่อนไขเดียวกับกระนวน") — เซลล์คงที่ default
   // เป็น "จุ่น" (ยืนยันจากผู้ใช้ 14 ก.ย.69) แก้ไขได้ที่หน้า /settings
@@ -43,7 +45,7 @@ export const samthongBranch: BranchConfig = {
   // โค้ด/ฯลฯ แบบที่พบในกระนวน) หรือไม่ — แยกจาก branch-level excludedCustomers
   // (ST57039) ด้านล่างโดยเจตนา เพราะ ST57039 เป็นการยกเว้นของสโคปรถทั่วไป
   // (ลูกค้ารถมิเตอร์) ไม่เกี่ยวกับกรอกหลังปั๊มเลย
-  departments: [{ code: "B3", label: "กรอกหลังปั๊ม", docPrefixes: ["HSB", "IVB", "IV"], minQtyLiters: 0, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: 0.1, fixedSalesperson: "จุ่น", excludedCustomers: [] }],
+  departments: [{ code: "B4", label: "กรอกหลังปั๊ม", docPrefixes: ["HSB", "IVB", "IV"], minQtyLiters: 0, requireExactMultiple: false, qtyMultipleOf: 1000, fixedFreightRate: 0.1, fixedSalesperson: "จุ่น", excludedCustomers: [] }],
 
   docPrefixToSaleType: { H: "cash", I: "credit" },
 
