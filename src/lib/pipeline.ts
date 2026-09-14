@@ -1,3 +1,4 @@
+import Decimal from "decimal.js";
 import { extractPdfText } from "./parser/pdfExtract";
 import { parseSalesReportText } from "./parser/salesReport";
 import { parseArReportText } from "./parser/arReport";
@@ -315,6 +316,8 @@ export async function runCommissionPipeline(
         meterAnnotation: line.meterAnnotation,
         salesperson,
         outstandingAmount: null,
+        outstandingQty: null,
+        outstandingFraction: null,
         arOutstandingReference: null,
         calc,
       });
@@ -335,14 +338,27 @@ export async function runCommissionPipeline(
   // แล้วทำเครื่องหมายเตือนบัญชี... ตั้งค่าเริ่มต้น = 0") lists it for
   // accounting's own manual 50%/100% policy judgment (§6-7) and leaves the
   // applied deduction at 0. Never assume one branch's mode for the other.
+  // A bill can be PARTIALLY paid (AR's own billAmount vs outstanding differ —
+  // confirmed against real data: e.g. IDB726080022 billed ฿70,600 but only
+  // ฿20,600 is still outstanding, ~29% of the bill) — deducting that row's
+  // FULL commission/liters would be wrong, over-deducting the portion
+  // already paid. The fraction still owed (outstanding / billAmount) is
+  // applied to both the liters and the commission for that row; a fully
+  // unpaid bill (outstanding == billAmount, the common case) still nets out
+  // to a fraction of 1 exactly as before.
   let matchedDebtTotal = 0;
   const debtMatches: ExportTransactionRow[] = [];
   for (const row of exportRows) {
     if (row.calc.commissionNumeric <= 0) continue;
     const matches = arByBaseDoc.get(row.baseDocNo);
     if (!matches || matches.length === 0) continue;
-    row.outstandingAmount = row.calc.commissionNumeric;
-    row.arOutstandingReference = matches.reduce((s, m) => s + m.outstanding, 0);
+    const totalBillAmount = matches.reduce((s, m) => s + m.billAmount, 0);
+    const totalOutstanding = matches.reduce((s, m) => s + m.outstanding, 0);
+    const outstandingFraction = totalBillAmount > 0 ? Math.min(1, Math.max(0, totalOutstanding / totalBillAmount)) : 1;
+    row.outstandingFraction = outstandingFraction;
+    row.outstandingQty = new Decimal(row.qty).times(outstandingFraction).toDecimalPlaces(2).toNumber();
+    row.outstandingAmount = new Decimal(row.calc.commissionNumeric).times(outstandingFraction).toDecimalPlaces(2).toNumber();
+    row.arOutstandingReference = totalOutstanding;
     matchedDebtTotal += row.outstandingAmount;
     debtMatches.push(row);
   }
@@ -412,7 +428,7 @@ export async function runCommissionPipeline(
     truckScopes,
     rows: exportRows,
     masterRows,
-    debtQtyTotal: debtMatches.reduce((s, r) => s + r.qty, 0),
+    debtQtyTotal: debtMatches.reduce((s, r) => s + (r.outstandingQty ?? 0), 0),
     standingNotes: branch.standingNotes,
     warnings,
   });

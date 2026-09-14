@@ -43,12 +43,17 @@ async function main() {
     debtRows.map((r) => `${r.docNo} ${r.customerCode} ${r.customerName} outstanding=${r.arOutstandingReference}`)
   );
 
-  console.log("\n=== EXPECTED (spec §8, เดือน 8/2569) ===");
-  console.log("qualifying rows: A7=25 B7=31 68=4 B3=13");
-  console.log("B3 total commission: 1079.1075");
-  console.log("อ้อม=4499.1075(→4499.11) ต้อม=720.00 วีระ=240.00 gross (before debt)");
-  console.log("debt matches: IDB726080022(20600) IDB726080043(107700) IDB726080044(107550) — auto-deducted (ยืนยันจากผู้ใช้ 11 ก.ย.69, หักเหมือนสามทอง)");
-  console.log("blocked rows among qualifying: should be 0 once master data is complete");
+  // NOTE: the spec's own §8 reference numbers (25/31/4/13 qualifying rows,
+  // ฿1,079.1075 for B3) predate two user-confirmed corrections (14 ก.ย.69):
+  // กรอกหลังปั๊ม has no per-line qty threshold at all (count every liter
+  // filled, not just lines >=1,000L), and the file's DSKN/G91KN/G95KN/B20KN
+  // product codes are real fuel SKUs that must be included — both raise
+  // B3's numbers well above that old reference. A7/B7/68's 25/31/4 rows and
+  // สามทอง's own regression numbers are unaffected and still the right
+  // check for those. Only sanity-check A7/B7/68 counts and "blocked among
+  // qualifying" (should stay 0) against the old reference here.
+  console.log("\n=== still-valid checks from spec §8 ===");
+  console.log("qualifying rows: A7=25 B7=31 68=4 (B3 no longer comparable — see note above)");
 
   console.log(`\n${result.warnings.length} warnings:`);
   result.warnings.forEach((w) => console.log("-", w));

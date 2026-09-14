@@ -38,7 +38,17 @@ export interface ExportTransactionRow {
   masterFound: boolean;
   meterAnnotation: string | null;
   salesperson: string | null;
-  outstandingAmount: number | null; // set once matched against AR (step 4)
+  /** commission actually attributed to the still-unpaid portion of the bill
+   *  — set once matched against AR (step 4); a fully-unpaid bill has
+   *  outstandingFraction 1 so this equals the row's full commission, but a
+   *  PARTIALLY paid bill (AR's own billAmount > outstanding) scales this
+   *  down proportionally rather than deducting the whole line */
+  outstandingAmount: number | null;
+  /** the liters this row's outstandingAmount corresponds to (qty × outstandingFraction) */
+  outstandingQty: number | null;
+  /** outstanding ÷ billAmount from the AR report, clamped to [0,1] — 1 for a
+   *  fully unpaid bill, less for a partial payment */
+  outstandingFraction: number | null;
   arOutstandingReference: number | null;
   calc: TransactionCalcResult;
 }
@@ -79,6 +89,13 @@ const PRODUCT_NAME_BY_CODE: Record<string, string> = {
   DSB20: "ดีเซลบี20",
   G91: "แก๊สโซฮอล์ 91",
   G95: "แก๊สโซฮอล์ 95",
+  // กระนวน กรอกหลังปั๊ม's own SKU codes for the same fuel types (see
+  // kranuan.ts's fuelProductCodes comment) — same display name as their
+  // non-KN counterpart, just a different underlying SKU code.
+  DSKN: "ดีเซล-2",
+  G91KN: "แก๊สโซฮอล์ 91",
+  G95KN: "แก๊สโซฮอล์ 95",
+  B20KN: "ดีเซลบี20",
 };
 
 function productLabel(code: string): string {
@@ -294,10 +311,10 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
 
   // ---------- หักหนี้ค้างชำระ ----------
   const debtSheet = workbook.addWorksheet(safeSheetName("หักหนี้ค้างชำระ", usedSheetNames));
-  debtSheet.mergeCells(1, 1, 1, 8);
+  debtSheet.mergeCells(1, 1, 1, 9);
   debtSheet.getCell("A1").value =
     branch.debtDeductionMode === "auto"
-      ? `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} (ทุกชนิดน้ำมันที่เข้าเกณฑ์)`
+      ? `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} (ทุกชนิดน้ำมันที่เข้าเกณฑ์) — บิลที่จ่ายมาบางส่วนแล้ว คิดเฉพาะสัดส่วนที่ยังค้างเท่านั้น ไม่ใช่เต็มบิล`
       : `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} — รายการนี้เป็น "การแจ้งเตือน" เท่านั้น ยังไม่ได้หักออกจากค่าคอมสุทธิ (ดูชีทค่าคอมรวม คอลัมน์ "หนี้ค้างที่ต้องพิจารณา" ที่ตั้งต้น 0) บัญชีต้องพิจารณาหักเอง 50%/100% ตาม policy ข้อ 6-7`;
   debtSheet.getRow(1).font = { bold: true };
   debtSheet.addRow([
@@ -305,24 +322,34 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     "ชื่อลูกค้า",
     "เอกสาร#",
     "วันที่",
-    "ลิตรที่เกี่ยวข้อง",
+    "ลิตรที่ค้าง (เฉพาะส่วนที่ยังไม่จ่าย)",
     "เซลล์",
-    branch.debtDeductionMode === "auto" ? "ค่าคอมของรายการนี้ (บาท)" : "ค่าคอมของรายการนี้ (บาท) — อ้างอิงเท่านั้น",
+    branch.debtDeductionMode === "auto" ? "ค่าคอมที่หัก (เฉพาะส่วนที่ยังค้าง)" : "ค่าคอมของส่วนที่ยังค้าง (บาท) — อ้างอิงเท่านั้น",
     `ยอดคงค้าง (บาท) ตามรายงานลูกหนี้ ${branch.arAsOfLabel}`,
+    "สถานะการจ่าย",
   ]);
   debtSheet.getRow(2).font = { bold: true };
   const debtRows = input.rows.filter((r) => (r.outstandingAmount ?? 0) > 0);
   for (const r of debtRows) {
     const s = truckSheetNameByLabel.get(r.truckLabel)!;
+    const isPartial = (r.outstandingFraction ?? 1) < 0.999;
+    // Liters/commission here are the OUTSTANDING PORTION only (qty/commission
+    // × outstandingFraction) — a partially-paid bill (AR's own billAmount >
+    // outstanding, confirmed against real data) must not deduct the whole
+    // line's commission, only the still-unpaid share. That's a derived
+    // number this workbook has no single live cell for, so it's written as
+    // a plain value rather than a cross-sheet formula like the other
+    // columns here.
     debtSheet.addRow([
       fv(`'${s}'!D${r.excelRow}`, r.customerCode),
       fv(`'${s}'!E${r.excelRow}`, r.customerName),
       fv(`'${s}'!C${r.excelRow}`, r.docNo),
       fv(`'${s}'!B${r.excelRow}`, toThaiDateDisplay(r.docDate)),
-      fv(`'${s}'!I${r.excelRow}`, r.qty),
+      r.outstandingQty ?? r.qty,
       fv(`'${s}'!S${r.excelRow}`, r.salesperson ?? "ตรวจสอบเซลล์"),
-      fv(`'${s}'!T${r.excelRow}`, r.calc.commission),
+      r.outstandingAmount,
       r.arOutstandingReference,
+      isPartial ? `จ่ายบางส่วนแล้ว — คิดเฉพาะส่วนที่ยังค้าง (${((r.outstandingFraction ?? 1) * 100).toFixed(1)}% ของบิล)` : "ค้างเต็มบิล",
     ]);
   }
   const debtDataLast = debtRows.length + 2;
