@@ -119,9 +119,21 @@ function toThaiDateDisplay(ddmmyy: string): string {
  * cached `result` so every cell shows a correct number immediately on
  * open — the formula itself stays live underneath for anyone who edits
  * Master and wants Excel to recalculate for real.
+ *
+ * An empty-string result is the one exception — real Excel opening a very
+ * large กระนวน B3 export (thousands of qty-qualifying rows once the
+ * per-line threshold was removed) threw "we found a problem with some
+ * content" and offered to repair it, traced to thousands of `t="str"`
+ * cells caching an empty `<v></v>`. That pattern round-trips fine through
+ * exceljs's own reader and other lenient viewers, so it went unnoticed
+ * until a real file this large actually got opened in Excel itself.
+ * Omitting `result` entirely for "" sidesteps the question of whether
+ * that's spec-legal — `workbook.calcProperties.fullCalcOnLoad = true` is
+ * already set, so Excel recomputes the formula the instant it opens
+ * either way.
  */
-function fv(formula: string, result: number | string): { formula: string; result: number | string } {
-  return { formula, result };
+function fv(formula: string, result: number | string): { formula: string; result?: number | string } {
+  return result === "" ? { formula } : { formula, result };
 }
 
 function saleTypeLabel(t: "cash" | "credit" | "overdue" | null): string {
@@ -472,7 +484,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     const srcRow = i + 2; // ค่าคอมรวม row for this salesperson
     const outRow = splitHeaderRow + 1 + i;
     const net = perSalesperson[i].net;
-    const cells: (string | number | { formula: string; result: number | string })[] = [name, fv(`ค่าคอมรวม!E${srcRow}`, net)];
+    const cells: (string | number | { formula: string; result?: number | string })[] = [name, fv(`ค่าคอมรวม!E${srcRow}`, net)];
     roleTotalsByCol.set(2, (roleTotalsByCol.get(2) ?? 0) + net);
 
     const shares: number[] = [];
@@ -503,7 +515,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     coverSheet.addRow(cells);
   });
   const totalRow = splitHeaderRow + 1 + branch.salespersonRoster.length;
-  const totalCells: (string | { formula: string; result: number | string })[] = ["รวม"];
+  const totalCells: (string | { formula: string; result?: number | string })[] = ["รวม"];
   for (let c = 2; c <= branch.teamSplit.roles.length + 2; c++) {
     const col = String.fromCharCode("A".charCodeAt(0) + c - 1);
     totalCells.push(fv(`SUM(${col}${splitHeaderRow + 1}:${col}${totalRow - 1})`, roleTotalsByCol.get(c) ?? 0));
