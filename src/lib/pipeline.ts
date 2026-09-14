@@ -1,5 +1,6 @@
 import Decimal from "decimal.js";
 import { extractPdfText } from "./parser/pdfExtract";
+import { fixThaiText } from "./parser/thaiPuaFix";
 import { parseSalesReportText } from "./parser/salesReport";
 import { parseArReportText } from "./parser/arReport";
 import { parseDistanceMasterText } from "./parser/distanceMaster";
@@ -185,7 +186,21 @@ export async function runCommissionPipeline(
   const excludedEntriesSeen = new Map<string, MasterEntry>();
 
   for (const file of salesFiles) {
-    const text = await extractPdfText(file.buffer);
+    const rawText = await extractPdfText(file.buffer);
+    // The sales-report PDFs' own embedded font maps several Thai tone
+    // marks/vowel signs to Private Use Area codepoints in its ToUnicode
+    // CMap — a defect in the file itself, confirmed by reading that CMap
+    // directly (see thaiPuaFix.ts). Fixing it here, on the raw text before
+    // parsing, means every downstream consumer (customer names on every
+    // sheet) gets the corrected text for free. NOT applied to the master
+    // file — verified that one has zero PUA codepoints; its own defect is
+    // unrelated and already handled by the OCR pass above.
+    const { fixed: text, unresolved } = fixThaiText(rawText);
+    if (unresolved.size > 0) {
+      warnings.push(
+        `[${file.filename}] พบรหัส Unicode ที่ยังไม่รู้จักแน่ชัด (${[...unresolved].join(", ")}) ในบางจุด — ชื่อลูกค้าที่มีรหัสเหล่านี้อาจยังมีตัวอักษรผิดเพี้ยน ควรตรวจด้วยตาก่อนส่งมอบ`
+      );
+    }
     const parsed = parseSalesReportText(text);
 
     // A file whose "เลือกแผนก" header (already extracted by the parser as
