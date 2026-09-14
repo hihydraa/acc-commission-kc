@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { PDFDocument } from "pdf-lib";
 
 /**
  * Every PDF this pipeline reads (master, and every per-truck sales report)
@@ -11,55 +12,45 @@ import Anthropic from "@anthropic-ai/sdk";
  * matching — that always goes through the customer CODE, which this same
  * text layer reads correctly), so this is purely a readability problem.
  *
- * Two earlier designs were tried and rejected on real production runs (both
- * against เบอร์71_ST_8.69.pdf / AR_ST_7.9.69.pdf) before this one:
- *  1. Tesseract OCR on a pixel crop — read the master file's clean table
- *     fine, but measurably WORSENED many names on the sales-report font
- *     ("คุณแมสุป" -> "คุณเม่สปี") across several crop/scale/margin attempts.
- *  2. Claude reading whole rendered PAGE images, several per request, with
- *     the codes list appended once at the end — the model blended unrelated
- *     customers together (codes came back with fabricated, phonetically
- *     unrelated names, and several different codes shared identical
- *     invented surnames). Labeling each full-page image with its own
- *     expected codes did NOT fix this on a second production run — a full
- *     page still has many OTHER visible names crowded around the requested
- *     one, which is apparently enough ambiguity for the model to pattern-
- *     match onto the wrong one instead of admitting it can't read a small
- *     specific detail confidently.
+ * Three earlier designs were tried and rejected on real production runs
+ * (against เบอร์71_ST_8.69.pdf / AR_ST_7.9.69.pdf) before this one:
+ *  1. Tesseract OCR on a pixel crop — worked on the master file's clean
+ *     table, but measurably WORSENED many names on the sales-report font.
+ *  2. Claude reading whole rendered PAGE images, several per request — the
+ *     model blended unrelated customers together even when each image was
+ *     labeled with its own expected codes.
+ *  3. Claude reading a TIGHT PIXEL CROP around one customer's name (one
+ *     crop = one customer, so cross-customer blending should have been
+ *     structurally impossible) — still came back mostly wrong, including
+ *     names that had read correctly under design #2. The crop that failed
+ *     looked perfectly legible on manual visual inspection of the SAME
+ *     render this codebase produces locally.
  *
- * This version crops a small, tight image around ONLY the printed name next
- * to ONE customer code (anchored on the code's own text position — reliable,
- * since only the Thai combining marks are corrupted, never the ASCII code).
- * One crop can physically only contain one customer's name, which removes
- * the cross-customer ambiguity that broke both earlier designs — the model
- * can still misread a genuinely illegible crop, but it cannot blend it with
- * a DIFFERENT customer's name the way it could pick the wrong name off a
- * busy full page.
+ * What #1-#3 all had in common: this codebase rendering the PDF to a raster
+ * image itself (pdfjs-dist + @napi-rs/canvas/skia) before showing it to
+ * anything. The one thing that's independently VERIFIED to read this exact
+ * kind of file correctly is Claude reading the PDF the user pastes directly
+ * into chat — which uses Claude's own native PDF handling, not a
+ * third-party renderer. skia evidently renders this PDF's (already known
+ * to have a defective font table) glyphs in a way a human eye smooths over
+ * but that trips up character-precise reading, on both a local OCR engine
+ * and Claude alike.
  *
- * Cost control ("ใช้ API ให้ประหยัด"): crops are tiny, so many of them (not
- * just a few full pages) are packed into one request; a page is only ever
- * rendered once no matter how many of its customers still need a crop, and
- * a code already resolved (anywhere) is never requested again.
+ * Fix: stop rendering ourselves. Extract just the ONE needed page into its
+ * own tiny single-page PDF (via pdf-lib — a cheap structural copy, no
+ * rasterization) and send that page as a native PDF `document` content
+ * block, exactly like a user pasting the file into chat, so Claude's own
+ * (already-proven) PDF renderer handles it instead of ours.
+ *
+ * Cost control ("ใช้ API ให้ประหยัด"): only a page actually containing a
+ * still-needed code is ever extracted (never a whole file blind), several
+ * single-page PDFs are batched per request instead of one request per
+ * customer, and a code already resolved (anywhere) is never requested again.
  */
 
 const MODEL = "claude-haiku-4-5-20251001";
-// Rendering a crop still means rasterizing the WHOLE page first (pdfjs has
-// no partial-region render) — a production run with ~80 customers spread
-// across a 41-page report meant ~80 separate full-page rasters at scale 4
-// with nothing capping the time spent, which is exactly what took the whole
-// request past Vercel's function limit (confirmed: the deployed endpoint
-// started returning the platform's own generic 500 instead of this
-// pipeline's own JSON error, meaning the function was killed before it
-// could respond at all). Scale 2 cuts that raster cost ~4x; the real fix is
-// the `deadline` check in the page loops below, which this alone doesn't
-// replace.
-const CROP_SCALE = 2;
-// TEMP DIAGNOSTIC: 1 crop per request, isolating whether batch size itself
-// is why a real production run (20/request) came back with mostly-wrong
-// names despite the crops themselves being legible on manual inspection —
-// see resolveCustomerNamesViaClaude's module doc once this is resolved.
-const CROPS_PER_REQUEST = 1;
-const REQUEST_CONCURRENCY = 5;
+const PAGES_PER_REQUEST = 6;
+const REQUEST_CONCURRENCY = 3;
 // Overall wall-clock budget for every Claude call in one pipeline run —
 // leaves headroom under the API route's own maxDuration for PDF parsing,
 // the commission calculation itself, and building the Excel workbook, all
@@ -70,86 +61,50 @@ const MASTER_CODE_RE = /^[A-Za-z]{1,5}\d{4,}$|^\d{6,}$/;
 const SALES_CUSTOMER_CODE_RE = /^[A-Za-z]{1,5}\d{4,}$/;
 const HEADER_LINE_RE = /^(.+?)\s*\/\s*(\S+)\s*$/;
 
-type PdfTextItem = { str: string; transform: number[]; width: number; height: number };
-type PdfDoc = import("pdfjs-dist/legacy/build/pdf.mjs").PDFDocumentProxy;
-type CanvasFactory = (w: number, h: number) => { getContext: (kind: "2d") => unknown; toBuffer: (mime: string) => Buffer };
+type PdfTextItem = { str: string };
 
 export interface ClaudeNameResult {
   namesByCode: Map<string, string>;
   warnings: string[];
 }
 
-interface CropTarget {
-  code: string;
-  x0: number;
-  y0: number;
-  x1: number;
-  y1: number;
-}
-
-interface CropJob {
-  code: string;
-  png: Buffer;
-}
-
-async function loadCanvasFactory(): Promise<CanvasFactory> {
-  // pdfjs-dist's renderer needs @napi-rs/canvas's node-canvas compat shim
-  // specifically (node-canvas.js) — the raw Canvas API throws a Path2D type
-  // error without it, and the plain `canvas` package silently renders every
-  // glyph as blank instead. Pinned to exactly 0.1.100 in package.json —
-  // newer majors change something in the native Path2D/fill implementation
-  // that breaks pdfjs-dist's rendering calls even through this same shim.
-  const { createRequire } = await import("module");
-  const require = createRequire(import.meta.url);
-  const { createCanvas } = require("@napi-rs/canvas/node-canvas.js") as { createCanvas: CanvasFactory };
-  return createCanvas;
+interface PageDoc {
+  source: string;
+  pageNum: number;
+  codes: string[];
+  pdfBase64: string;
 }
 
 /**
- * Scans every page of `buffer` (text-content only — cheap, no rendering) for
- * still-needed codes from `remaining`, computing each one's crop region
- * directly from its text item's own position. Claims a code the moment its
- * region is found (mutates `remaining`) so a later file never redoes the
- * work. `isMaster` picks the layout rule:
+ * Text-content-only scan (cheap, no rendering) for which PAGE each
+ * still-needed code's header is on, and which OTHER still-needed codes
+ * share that same page — `isMaster` picks the layout rule:
  *  - master (distance/เซลล์) file: a real table, the code is its own text
- *    item — crop the name column immediately to its left.
+ *    item.
  *  - a sales-report file: an inline "<name> /<code>" header line, where the
  *    code is sometimes its own text item and sometimes glued to the name in
- *    one item (verified against real files — no single assumption holds) —
- *    crop the WHOLE line's bounding box instead of trying to isolate a
- *    token. Line pitch here is much tighter than the master table's, so the
- *    vertical margin is kept small to avoid bleeding into the row above/
- *    below (verified: a generous margin picks up the previous row's text).
+ *    one item (verified against real files) — matched on the joined line
+ *    text instead of a single item.
+ * Claims every code it finds (mutates `remaining`) so a later file never
+ * rescans for something already located.
  */
-async function collectCropTargets(
-  buffer: Buffer,
-  remaining: Set<string>,
-  isMaster: boolean,
-  deadline: number
-): Promise<{ doc: PdfDoc; targetsByPage: Map<number, CropTarget[]>; timedOut: boolean }> {
+async function locatePages(buffer: Buffer, remaining: Set<string>, isMaster: boolean): Promise<Map<number, string[]>> {
+  const pagesFound = new Map<number, string[]>();
+  if (remaining.size === 0) return pagesFound;
+
   const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const doc = await pdfjsLib.getDocument({ data: new Uint8Array(buffer), stopAtErrors: false, isEvalSupported: false }).promise;
-  const targetsByPage = new Map<number, CropTarget[]>();
-  if (remaining.size === 0) return { doc, targetsByPage, timedOut: false };
 
   for (let pageNum = 1; pageNum <= doc.numPages && remaining.size > 0; pageNum++) {
-    if (Date.now() > deadline) return { doc, targetsByPage, timedOut: true };
     const page = await doc.getPage(pageNum);
-    const viewport = page.getViewport({ scale: CROP_SCALE });
     const content = await page.getTextContent({ disableNormalization: true });
-    const items = content.items.filter((i) => "str" in i && "transform" in i) as unknown as PdfTextItem[];
-    const targets: CropTarget[] = [];
+    const items = content.items.filter((i) => "str" in i && "transform" in i) as unknown as (PdfTextItem & { transform: number[] })[];
+    const found: string[] = [];
 
     if (isMaster) {
       for (const item of items) {
         const code = item.str.trim().toUpperCase();
-        if (!MASTER_CODE_RE.test(code) || !remaining.has(code)) continue;
-        remaining.delete(code);
-        const [vx, vy] = viewport.convertToViewportPoint(item.transform[4], item.transform[5]);
-        const h = item.height * CROP_SCALE;
-        const x0 = 42 * CROP_SCALE; // past the ลำดับ column and the table's own left border
-        const x1 = Math.max(x0 + 10, vx - 15); // stop just left of the code token
-        targets.push({ code, x0, y0: vy - h - 6, x1, y1: vy + 10 });
+        if (MASTER_CODE_RE.test(code) && remaining.has(code)) found.push(code);
       }
     } else {
       const lines = new Map<number, PdfTextItem[]>();
@@ -160,54 +115,33 @@ async function collectCropTargets(
         lines.set(y, arr);
       }
       for (const rowItems of lines.values()) {
-        const sorted = [...rowItems].sort((a, b) => a.transform[4] - b.transform[4]);
-        const trimmed = sorted.map((i) => i.str).join("").trim();
+        const trimmed = rowItems.map((i) => i.str).join("").trim();
         if (!trimmed || /\d+\.\d+/.test(trimmed) || trimmed.includes("ลิตร")) continue; // data/subtotal line, not a header
         const m = trimmed.match(HEADER_LINE_RE);
         if (!m) continue;
         const code = m[2].toUpperCase();
-        if (!SALES_CUSTOMER_CODE_RE.test(code) || !remaining.has(code)) continue;
-        remaining.delete(code);
-
-        const nonSpace = sorted.filter((i) => i.str.trim() !== "");
-        if (nonSpace.length === 0) continue;
-        const minXpdf = Math.min(...nonSpace.map((i) => i.transform[4]));
-        const maxXpdf = Math.max(...nonSpace.map((i) => i.transform[4] + (i.width || 0)));
-        const yPdf = sorted[0].transform[5];
-        const hPdf = Math.max(...nonSpace.map((i) => i.height || 12));
-        const [vx0, vy] = viewport.convertToViewportPoint(minXpdf, yPdf);
-        const [vx1] = viewport.convertToViewportPoint(maxXpdf, yPdf);
-        const h = hPdf * CROP_SCALE;
-        const marginX = 3 * CROP_SCALE;
-        targets.push({ code, x0: Math.max(0, vx0 - marginX), y0: vy - h - 2, x1: vx1 + marginX, y1: vy + 3 });
+        if (SALES_CUSTOMER_CODE_RE.test(code) && remaining.has(code)) found.push(code);
       }
     }
-    if (targets.length > 0) targetsByPage.set(pageNum, targets);
+    if (found.length === 0) continue;
+    const unique = [...new Set(found)];
+    unique.forEach((c) => remaining.delete(c));
+    pagesFound.set(pageNum, unique);
   }
-  return { doc, targetsByPage, timedOut: false };
+  return pagesFound;
 }
 
-/** Renders `pageNum` once and cuts every one of its crop targets out of
- *  that single render — a page with 15 needed customers costs one render,
- *  not 15. */
-async function renderCrops(doc: PdfDoc, pageNum: number, targets: CropTarget[], createCanvas: CanvasFactory): Promise<CropJob[]> {
-  const page = await doc.getPage(pageNum);
-  const viewport = page.getViewport({ scale: CROP_SCALE });
-  const canvas = createCanvas(viewport.width, viewport.height);
-  const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
-  await page.render({ canvasContext: ctx, viewport }).promise;
-
-  const jobs: CropJob[] = [];
-  for (const t of targets) {
-    const w = t.x1 - t.x0;
-    const h = t.y1 - t.y0;
-    if (w <= 0 || h <= 0) continue;
-    const cropCanvas = createCanvas(w, h);
-    const cropCtx = cropCanvas.getContext("2d") as CanvasRenderingContext2D;
-    cropCtx.drawImage(canvas as unknown as CanvasImageSource, t.x0, t.y0, w, h, 0, 0, w, h);
-    jobs.push({ code: t.code, png: cropCanvas.toBuffer("image/png") });
-  }
-  return jobs;
+/** Copies ONE page out of `buffer` into its own brand-new single-page PDF —
+ *  a structural copy (pdf-lib), never a rasterization, so this never
+ *  inherits skia's rendering quirks and costs almost nothing regardless of
+ *  how large the source report is. */
+async function extractPageAsPdf(buffer: Buffer, pageIndexZeroBased: number): Promise<string> {
+  const srcDoc = await PDFDocument.load(buffer, { ignoreEncryption: true });
+  const outDoc = await PDFDocument.create();
+  const [copied] = await outDoc.copyPages(srcDoc, [pageIndexZeroBased]);
+  outDoc.addPage(copied);
+  const bytes = await outDoc.save();
+  return Buffer.from(bytes).toString("base64");
 }
 
 function extractJson(text: string): unknown {
@@ -219,29 +153,31 @@ function extractJson(text: string): unknown {
   return JSON.parse(body.slice(start, end + 1));
 }
 
-async function callClaudeForCrops(client: Anthropic, crops: CropJob[]): Promise<Map<string, string>> {
+async function callClaudeForPages(client: Anthropic, pages: PageDoc[]): Promise<Map<string, string>> {
   const result = new Map<string, string>();
-  if (crops.length === 0) return result;
+  if (pages.length === 0) return result;
 
-  // Each image is a tight crop containing exactly ONE customer's printed
-  // name — physically impossible to blend with another customer's, unlike
-  // the whole-page-image design this replaced (see module doc).
+  // Each PDF page is Claude's own native document reading (not a raster
+  // image this codebase produced) — see module doc for why that distinction
+  // is the actual fix, not just another prompt tweak.
   const content: Anthropic.ContentBlockParam[] = [];
-  crops.forEach((c, i) => {
-    content.push({ type: "text", text: `Image ${i + 1} = customer code ${c.code}` });
-    content.push({ type: "image", source: { type: "base64", media_type: "image/png", data: c.png.toString("base64") } });
+  pages.forEach((p, i) => {
+    content.push({ type: "text", text: `Document ${i + 1} — customer codes to find on THIS page only: ${p.codes.join(", ")}` });
+    content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: p.pdfBase64 } });
   });
+  const allCodes = pages.flatMap((p) => p.codes);
   content.push({
     type: "text",
     text:
-      `Each image above is a tight crop from a Thai PDF report, showing ONLY the customer name printed for the one customer code labeled just before it (the code itself may or may not be visible in the crop — ignore it either way, you already have it from the label). Read the EXACT Thai name in each crop, including every tone mark and vowel exactly as shown (the source PDF's own embedded text is corrupted for these — read the visible glyphs, not any text you might otherwise infer).\n\n` +
-      `If a crop is blank, cut off, or genuinely illegible, omit that code rather than guessing.\n\n` +
-      `Respond with ONLY a JSON object mapping each code to its exact Thai name, e.g. {"KCL660012":"ปั๊ม นิมิตรบริการ"}. No other text.`,
+      `Each document above is one page of a Thai fuel-sales/customer PDF report, labeled with the customer codes printed somewhere ON THAT SPECIFIC PAGE. For each code, find it on its labeled page and read the EXACT Thai customer name printed right next to it (include every tone mark and vowel exactly as shown — this report's own embedded text layer is corrupted for these, so read what's actually printed on the page, not any text layer).\n\n` +
+      `Rules: only report a name you can actually find on that code's own labeled page; never guess or reuse a name from a different code; omit a code entirely rather than answer it if you're not confident.\n\n` +
+      `All codes across every page: ${allCodes.join(", ")}\n\n` +
+      `Respond with ONLY a JSON object mapping each code you found to its exact Thai name, e.g. {"KCL660012":"ปั๊ม นิมิตรบริการ"}. No other text.`,
   });
 
   const msg = await client.messages.create({
     model: MODEL,
-    max_tokens: Math.min(4096, 200 + crops.length * 40),
+    max_tokens: Math.min(4096, 200 + allCodes.length * 40),
     messages: [{ role: "user", content }],
   });
 
@@ -278,34 +214,19 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
     return { namesByCode, warnings };
   }
   const client = new Anthropic({ apiKey });
-  const createCanvas = await loadCanvasFactory();
 
-  // ONE deadline for the whole function, not one per phase — rendering a
-  // crop still means rasterizing its entire page first (pdfjs has no
-  // partial-region render), so with a customer spread thinly across a
-  // multi-hundred-page report, the RENDER phase can be just as expensive as
-  // the API-call phase. A budget that only covered the API phase let a real
-  // production run render ~80 separate full pages with nothing capping the
-  // time spent, which ran the whole request past Vercel's own function
-  // limit and killed it before this module's own graceful-fallback warnings
-  // could ever be returned.
   const deadline = Date.now() + TOTAL_BUDGET_MS;
-  let renderTimedOut = false;
-
   const remaining = new Set(targetCodes);
-  const cropJobs: CropJob[] = [];
+  const pageDocs: PageDoc[] = [];
 
   async function collect(buffer: Buffer, source: string, isMaster: boolean) {
     if (remaining.size === 0 || Date.now() > deadline) return;
     try {
-      const { doc, targetsByPage, timedOut } = await collectCropTargets(buffer, remaining, isMaster, deadline);
-      if (timedOut) renderTimedOut = true;
-      for (const [pageNum, targets] of targetsByPage) {
-        if (Date.now() > deadline) {
-          renderTimedOut = true;
-          break;
-        }
-        cropJobs.push(...(await renderCrops(doc, pageNum, targets, createCanvas)));
+      const pages = await locatePages(buffer, remaining, isMaster);
+      for (const [pageNum, codes] of pages) {
+        if (Date.now() > deadline) break;
+        const pdfBase64 = await extractPageAsPdf(buffer, pageNum - 1);
+        pageDocs.push({ source, pageNum, codes, pdfBase64 });
       }
     } catch (err) {
       warnings.push(`[แก้ชื่อภาษาไทยด้วย Claude] อ่านไฟล์ '${source}' ไม่สำเร็จ — ใช้ชื่อจากไฟล์ตามปกติแทน (${err instanceof Error ? err.message : String(err)})`);
@@ -315,17 +236,12 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
   if (masterFile) await collect(masterFile, "master", true);
   for (const f of salesFiles) await collect(f.buffer, f.filename, false);
 
-  if (cropJobs.length === 0) {
-    if (renderTimedOut) {
-      warnings.push(`[แก้ชื่อภาษาไทยด้วย Claude] อ่าน/แปลงหน้า PDF ใช้เวลาเกิน ${TOTAL_BUDGET_MS / 1000} วินาที ก่อนจะเริ่มแก้ชื่อได้แม้แต่รายการเดียว — ใช้ชื่อจากไฟล์ตามปกติทั้งหมด`);
-    }
-    return { namesByCode, warnings };
-  }
+  if (pageDocs.length === 0) return { namesByCode, warnings };
 
-  const batches: CropJob[][] = [];
-  for (let i = 0; i < cropJobs.length; i += CROPS_PER_REQUEST) batches.push(cropJobs.slice(i, i + CROPS_PER_REQUEST));
+  const batches: PageDoc[][] = [];
+  for (let i = 0; i < pageDocs.length; i += PAGES_PER_REQUEST) batches.push(pageDocs.slice(i, i + PAGES_PER_REQUEST));
 
-  let timedOut = renderTimedOut;
+  let timedOut = false;
   let nextBatch = 0;
   let apiErrors = 0;
 
@@ -337,8 +253,8 @@ export async function resolveCustomerNamesViaClaude({ masterFile, salesFiles, ta
       }
       const batch = batches[nextBatch++];
       try {
-        const expectedCodes = new Set(batch.map((c) => c.code));
-        const found = await callClaudeForCrops(client, batch);
+        const expectedCodes = new Set(batch.flatMap((p) => p.codes));
+        const found = await callClaudeForPages(client, batch);
         for (const [code, name] of found) {
           // Defense in depth against a malformed response: never accept a
           // code this batch didn't actually ask about.
