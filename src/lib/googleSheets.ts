@@ -118,28 +118,79 @@ export async function readBranchRoster(tabName: string): Promise<string[]> {
   return [...new Set(rows.map((r) => r.salesperson).filter(Boolean))];
 }
 
+/** 0-based column index -> spreadsheet letter (0="A", 25="Z", 26="AA", ...). */
+function columnLetter(index: number): string {
+  let n = index + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
 /** Update-if-code-found / append-if-new, matched by the รหัส column —
- *  called when the user confirms/edits a customer on the confirmation page. */
+ *  called when the user confirms/edits a customer on the confirmation page.
+ *
+ * Writes by HEADER NAME, same as readBranchSheet — the two tabs' column
+ * ORDER differs (ST: ลำดับ, ชื่อลูกค้า, รหัส, พื้นที่, ระยะทาง/กม., สินค้า,
+ * เซลล์, หมายเหตุ) — hardcoding "A:F" here previously wrote every field one
+ * column off from where it actually belongs. Any column this code doesn't
+ * know about (ลำดับ, สินค้า) is preserved as-is on an update, or left blank
+ * on a brand-new append, rather than being overwritten with the wrong value. */
 export async function upsertRow(tabName: string, row: Omit<SheetRow, "rowNumber">): Promise<void> {
-  const existing = await readBranchSheet(tabName);
-  const match = existing.find((r) => r.customerCode === row.customerCode);
+  const values = await fetchRange(tabName, "A1:Z1000");
+  if (values.length === 0) throw new Error(`Sheet tab '${tabName}' ไม่มีข้อมูล (ไม่พบแม้แต่แถวหัวตาราง)`);
+  const header = values[0].map((h) => h.trim());
+  const col = (name: string) => header.indexOf(name);
+  const idxCode = col("รหัส");
+  const idxName = col("ชื่อลูกค้า");
+  const idxArea = col("พื้นที่");
+  const idxDistance = col("ระยะทาง/กม.");
+  const idxTag = col("หมายเหตุ");
+  const idxSalesperson = col("เซลล์");
+  if (idxCode < 0) throw new Error(`Sheet tab '${tabName}' ไม่มีคอลัมน์ 'รหัส' — ไม่รู้จะเขียนลงคอลัมน์ไหน`);
+
+  let rowNumber: number | null = null;
+  let rowValues: string[] = new Array(header.length).fill("");
+  for (let i = 1; i < values.length; i++) {
+    if ((values[i][idxCode] ?? "").trim() === row.customerCode) {
+      rowNumber = i + 1;
+      rowValues = [...values[i]];
+      while (rowValues.length < header.length) rowValues.push("");
+      break;
+    }
+  }
+  const isNew = rowNumber === null;
+  if (isNew) rowNumber = values.length + 1;
+
+  rowValues[idxCode] = row.customerCode;
+  if (idxName >= 0) rowValues[idxName] = row.customerName;
+  if (idxArea >= 0) rowValues[idxArea] = row.area;
+  if (idxTag >= 0) {
+    // Separate tag column exists (ST) — distance and tag are independent.
+    rowValues[idxDistance] = row.tag ? "" : row.distanceKm != null ? String(row.distanceKm) : "";
+    rowValues[idxTag] = row.tag;
+  } else if (idxDistance >= 0) {
+    // No dedicated tag column (KN) — the tag text goes IN the distance
+    // column itself, same convention readBranchSheet already expects.
+    rowValues[idxDistance] = row.tag ? row.tag : row.distanceKm != null ? String(row.distanceKm) : "";
+  }
+  if (idxSalesperson >= 0) rowValues[idxSalesperson] = row.salesperson;
+  // ลำดับ (col A on both known tabs) is a cosmetic sequence number, not part
+  // of our data model — auto-number a brand-new row so it isn't left blank;
+  // an existing row's ลำดับ is preserved untouched via the rowValues copy above.
+  if (isNew && header[0] === "ลำดับ") rowValues[0] = String(values.length);
+
   const client = getClient();
   const token = await client.getAccessToken();
-  const values = [row.customerCode, row.customerName, row.area, row.distanceKm ?? "", row.salesperson, row.tag];
-
-  if (match) {
-    const res = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(`${tabName}!A${match.rowNumber}:F${match.rowNumber}`)}?valueInputOption=USER_ENTERED`,
-      { method: "PUT", headers: { Authorization: `Bearer ${token.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [values] }) }
-    );
-    if (!res.ok) throw new Error(`Google Sheets update failed (${res.status}): ${await res.text()}`);
-  } else {
-    const res = await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(`${tabName}!A1`)}:append?valueInputOption=USER_ENTERED`,
-      { method: "POST", headers: { Authorization: `Bearer ${token.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [values] }) }
-    );
-    if (!res.ok) throw new Error(`Google Sheets append failed (${res.status}): ${await res.text()}`);
-  }
+  const lastCol = columnLetter(header.length - 1);
+  const res = await fetch(
+    `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(`${tabName}!A${rowNumber}:${lastCol}${rowNumber}`)}?valueInputOption=USER_ENTERED`,
+    { method: "PUT", headers: { Authorization: `Bearer ${token.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [rowValues] }) }
+  );
+  if (!res.ok) throw new Error(`Google Sheets ${isNew ? "append" : "update"} failed (${res.status}): ${await res.text()}`);
 }
 
 /** Builds a MasterLookup (see pipeline.ts) from a branch's live Sheet data.

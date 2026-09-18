@@ -54,12 +54,48 @@ function baht(n: number): string {
 
 type Step = "upload" | "confirm" | "result";
 
+/** File input that ADDS newly picked files to what's already selected
+ *  (native <input type=file> replaces the whole selection on every pick)
+ *  and lets each file be removed individually before submitting. */
+function FileListInput({ label, files, onChange }: { label: string; files: File[]; onChange: (files: File[]) => void }) {
+  function handlePick(e: React.ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(e.target.files ?? []);
+    if (picked.length > 0) {
+      const existingKeys = new Set(files.map((f) => `${f.name}|${f.size}|${f.lastModified}`));
+      const deduped = picked.filter((f) => !existingKeys.has(`${f.name}|${f.size}|${f.lastModified}`));
+      onChange([...files, ...deduped]);
+    }
+    e.target.value = ""; // allow re-picking the same file later
+  }
+  function remove(idx: number) {
+    onChange(files.filter((_, i) => i !== idx));
+  }
+  return (
+    <div>
+      <label className="block text-sm font-medium">{label}</label>
+      <input type="file" accept="application/pdf" multiple className="mt-1 w-full text-sm" onChange={handlePick} />
+      {files.length > 0 && (
+        <ul className="mt-2 space-y-1">
+          {files.map((f, idx) => (
+            <li key={`${f.name}|${f.size}|${f.lastModified}`} className="flex items-center justify-between rounded bg-neutral-100 px-2 py-1 text-xs">
+              <span className="truncate">{f.name}</span>
+              <button type="button" onClick={() => remove(idx)} className="ml-2 shrink-0 text-red-700 hover:underline">
+                ลบ
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export default function Home() {
   const [step, setStep] = useState<Step>("upload");
   const [branchId, setBranchId] = useState(BRANCHES[0]?.id ?? "");
-  const [meterTruckFiles, setMeterTruckFiles] = useState<FileList | null>(null);
-  const [trailerFiles, setTrailerFiles] = useState<FileList | null>(null);
-  const [pumpFillFiles, setPumpFillFiles] = useState<FileList | null>(null);
+  const [meterTruckFiles, setMeterTruckFiles] = useState<File[]>([]);
+  const [trailerFiles, setTrailerFiles] = useState<File[]>([]);
+  const [pumpFillFiles, setPumpFillFiles] = useState<File[]>([]);
   const [arFile, setArFile] = useState<File | null>(null);
 
   const [periodLabel, setPeriodLabel] = useState("");
@@ -79,16 +115,16 @@ export default function Home() {
   function collectFormFiles(): FormData {
     const form = new FormData();
     form.set("branchId", branchId);
-    Array.from(meterTruckFiles ?? []).forEach((f) => form.append("meterTruckFiles", f));
-    Array.from(trailerFiles ?? []).forEach((f) => form.append("trailerFiles", f));
-    Array.from(pumpFillFiles ?? []).forEach((f) => form.append("pumpFillFiles", f));
+    meterTruckFiles.forEach((f) => form.append("meterTruckFiles", f));
+    trailerFiles.forEach((f) => form.append("trailerFiles", f));
+    pumpFillFiles.forEach((f) => form.append("pumpFillFiles", f));
     return form;
   }
 
   async function handleResolve(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    const hasAnyFile = (meterTruckFiles?.length ?? 0) + (trailerFiles?.length ?? 0) + (pumpFillFiles?.length ?? 0) > 0;
+    const hasAnyFile = meterTruckFiles.length + trailerFiles.length + pumpFillFiles.length > 0;
     if (!hasAnyFile) {
       setError("กรุณาแนบไฟล์อย่างน้อย 1 ไฟล์ (รถมิเตอร์/รถเทรลเลอร์/กรอกหลังปั๊ม)");
       return;
@@ -226,9 +262,9 @@ export default function Home() {
     setStep("upload");
     setResult(null);
     setRows([]);
-    setMeterTruckFiles(null);
-    setTrailerFiles(null);
-    setPumpFillFiles(null);
+    setMeterTruckFiles([]);
+    setTrailerFiles([]);
+    setPumpFillFiles([]);
     setArFile(null);
   }
 
@@ -276,21 +312,9 @@ export default function Home() {
               </div>
             </div>
 
-            <div>
-              <label className="block text-sm font-medium">รถมิเตอร์ (เลือกได้หลายไฟล์)</label>
-              <input type="file" accept="application/pdf" multiple className="mt-1 w-full text-sm" onChange={(e) => setMeterTruckFiles(e.target.files)} />
-              {meterTruckFiles && <p className="mt-1 text-xs text-neutral-500">เลือกแล้ว {meterTruckFiles.length} ไฟล์</p>}
-            </div>
-            <div>
-              <label className="block text-sm font-medium">รถเทรลเลอร์ (เลือกได้หลายไฟล์)</label>
-              <input type="file" accept="application/pdf" multiple className="mt-1 w-full text-sm" onChange={(e) => setTrailerFiles(e.target.files)} />
-              {trailerFiles && <p className="mt-1 text-xs text-neutral-500">เลือกแล้ว {trailerFiles.length} ไฟล์</p>}
-            </div>
-            <div>
-              <label className="block text-sm font-medium">กรอกหลังปั๊ม (เลือกได้หลายไฟล์)</label>
-              <input type="file" accept="application/pdf" multiple className="mt-1 w-full text-sm" onChange={(e) => setPumpFillFiles(e.target.files)} />
-              {pumpFillFiles && <p className="mt-1 text-xs text-neutral-500">เลือกแล้ว {pumpFillFiles.length} ไฟล์</p>}
-            </div>
+            <FileListInput label="รถมิเตอร์ (เลือกได้หลายไฟล์)" files={meterTruckFiles} onChange={setMeterTruckFiles} />
+            <FileListInput label="รถเทรลเลอร์ (เลือกได้หลายไฟล์)" files={trailerFiles} onChange={setTrailerFiles} />
+            <FileListInput label="กรอกหลังปั๊ม (เลือกได้หลายไฟล์)" files={pumpFillFiles} onChange={setPumpFillFiles} />
             <div>
               <label className="block text-sm font-medium">รายงานลูกหนี้ค้างชำระ *</label>
               <input type="file" accept="application/pdf" className="mt-1 w-full text-sm" onChange={(e) => setArFile(e.target.files?.[0] ?? null)} />
