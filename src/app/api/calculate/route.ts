@@ -74,20 +74,31 @@ export async function POST(request: NextRequest) {
     // Write back only rows the user actually edited on the confirmation
     // page — never rewrite a Sheet row that arrived already correct, so an
     // unedited run makes zero writes to the shared Sheet.
+    //
+    // Sequential, not Promise.all/allSettled: upsertRow reads the sheet's
+    // current row count to decide where to append, so running several
+    // concurrently races and can clobber a row (two new customers both
+    // reading "34 rows" and both appending at row 35). Errors are collected
+    // as warnings on the response instead of thrown/swallowed — a failed
+    // write (e.g. a brand-new branch tab, or a transient API error)
+    // previously vanished silently and the user had no way to know their
+    // edit never reached the Sheet.
+    const sheetWriteWarnings: string[] = [];
     const edited = confirmed.filter((c) => c.edited);
-    if (edited.length > 0) {
-      await Promise.allSettled(
-        edited.map((c) =>
-          upsertRow(branch.sheetTabName, {
-            customerCode: c.customerCode,
-            customerName: c.customerName,
-            area: "",
-            distanceKm: c.distanceKm,
-            tag: c.tag,
-            salesperson: c.salesperson,
-          })
-        )
-      );
+    for (const c of edited) {
+      try {
+        await upsertRow(branch.sheetTabName, {
+          customerCode: c.customerCode,
+          customerName: c.customerName,
+          area: "",
+          distanceKm: c.distanceKm,
+          tag: c.tag,
+          salesperson: c.salesperson,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        sheetWriteWarnings.push(`[Google Sheet] บันทึกข้อมูลลูกค้า ${c.customerCode} ไม่สำเร็จ: ${message}`);
+      }
     }
 
     const fileBase64 = Buffer.from(result.workbook).toString("base64");
@@ -97,7 +108,7 @@ export async function POST(request: NextRequest) {
       filename,
       fileBase64,
       summary: result.summary,
-      warnings: result.warnings,
+      warnings: [...sheetWriteWarnings, ...result.warnings],
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -139,9 +139,25 @@ function columnLetter(index: number): string {
  * column off from where it actually belongs. Any column this code doesn't
  * know about (ลำดับ, สินค้า) is preserved as-is on an update, or left blank
  * on a brand-new append, rather than being overwritten with the wrong value. */
+const CANONICAL_HEADER = ["ลำดับ", "ชื่อลูกค้า", "รหัส", "พื้นที่", "ระยะทาง/กม.", "เซลล์", "หมายเหตุ"];
+
 export async function upsertRow(tabName: string, row: Omit<SheetRow, "rowNumber">): Promise<void> {
-  const values = await fetchRange(tabName, "A1:Z1000");
-  if (values.length === 0) throw new Error(`Sheet tab '${tabName}' ไม่มีข้อมูล (ไม่พบแม้แต่แถวหัวตาราง)`);
+  let values = await fetchRange(tabName, "A1:Z1000");
+  if (values.length === 0) {
+    // A brand-new branch's tab (e.g. มุกดาหาร/วานรนิวาส before any data was
+    // ever entered) has no header row at all — write one instead of
+    // failing outright, so the very first confirmed customer isn't silently
+    // lost (previously threw here, and the caller's Promise.allSettled
+    // swallowed it with no visible error to the user).
+    const client0 = getClient();
+    const token0 = await client0.getAccessToken();
+    const res0 = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${SPREADSHEET_ID}/values/${encodeURIComponent(`${tabName}!A1`)}?valueInputOption=USER_ENTERED`,
+      { method: "PUT", headers: { Authorization: `Bearer ${token0.token}`, "Content-Type": "application/json" }, body: JSON.stringify({ values: [CANONICAL_HEADER] }) }
+    );
+    if (!res0.ok) throw new Error(`สร้างหัวตารางใน Sheet tab '${tabName}' ไม่สำเร็จ (${res0.status}): ${await res0.text()}`);
+    values = [CANONICAL_HEADER];
+  }
   const header = values[0].map((h) => h.trim());
   const col = (name: string) => header.indexOf(name);
   const idxCode = col("รหัส");
