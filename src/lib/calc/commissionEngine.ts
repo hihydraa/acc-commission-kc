@@ -13,25 +13,14 @@ export type SaleType = "cash" | "credit" | "overdue";
  * formulas, not a stricter one, or the cross-check is comparing two
  * different specs instead of verifying one.
  *
- * Key template behavior worth calling out because it's more lenient than a
- * naive read of the SKILL text would suggest: สามทอง's approved template's M
- * (ค่าขนส่ง/ลิตร) formula NEVER blocks — a missing distance, a distance
- * outside the freight table, or a customer entirely absent from Master all
- * resolve to M=0 rather than an error. That is safe ONLY because the
- * pipeline is expected to have already resolved every qualifying customer's
- * distance/เซลล์ into the Master sheet (asking the user for anything
- * missing) before this workbook is finalized — so this module still raises a
- * `flags` entry for "no master row at all" and "distance outside the table"
- * so those gaps stay visible to a reviewer, even though the number itself
- * doesn't stop being computed.
- *
- * This is genuinely branch-specific, not a universal rule — see
- * CommissionConfig.freightMissingBehavior. กระนวน's own confirmed v2 spec
- * found that v1's identical "default to 0" behavior silently overstated
- * profit-per-liter and overpaid commission, and requires BLOCKING that row
- * instead (never guessing M) until a human resolves it. Both behaviors live
- * in this one function, selected per branch — never hardcode one branch's
- * choice as if it were universal.
+ * M (ค่าขนส่ง/ลิตร) ALWAYS blocks when it can't be resolved — a missing
+ * distance, a distance outside the freight table, and no fixed rate/tag-zero
+ * override all leave the row unresolved rather than silently defaulting to
+ * 0 (สามทอง's old per-branch behavior, dropped 2026-09-18: a guessed M=0
+ * understates ค่าขนส่ง and overpays commission, exactly the bug กระนวน's v2
+ * spec found). The confirmation page (src/app/confirm) is what resolves
+ * these before final calculation runs, for every branch — so nothing ever
+ * reaches this function still needing a guess.
  */
 export interface EligibilityConfig {
   fuelProductCodes: Set<string>;
@@ -58,9 +47,6 @@ export interface CommissionConfig {
    *  user even though it defaults on (matched every real transaction seen
    *  so far). */
   penaltyNegativeQEnabled: boolean;
-  /** see BranchConfig.freightMissingBehavior — "defaultZero" (สามทอง) or
-   *  "block" (กระนวน's confirmed v2 spec) */
-  freightMissingBehavior: "defaultZero" | "block";
 }
 
 export interface TransactionInput {
@@ -124,13 +110,8 @@ export function calculateTransaction(
   freightTiers: FreightTier[] = DEFAULT_FREIGHT_TIERS
 ): TransactionCalcResult {
   const flags: string[] = [];
-  const isMasterDefaultZeroBranch = config.freightMissingBehavior === "defaultZero";
   if (!tx.masterFound) {
-    flags.push(
-      isMasterDefaultZeroBranch
-        ? "ไม่พบลูกค้านี้ในไฟล์ master เลย — VLOOKUP ระยะทาง/เซลล์ว่าง, M=0 โดยดีฟอลต์ (ต้องยืนยันระยะทาง/เซลล์กับผู้ใช้)"
-        : "ไม่พบลูกค้านี้ในไฟล์ master เลย — ต้องเพิ่มระยะทาง/เซลล์ก่อนจึงจะคำนวณค่าคอมได้"
-    );
+    flags.push("ไม่พบลูกค้านี้ในข้อมูล master เลย — ต้องเพิ่มระยะทาง/เซลล์ก่อนจึงจะคำนวณค่าคอมได้");
   }
 
   const qualifiesByQty = eligibility.fuelProductCodes.has(tx.productCode) && passesQtyRule(tx.qty, eligibility);
@@ -143,24 +124,15 @@ export function calculateTransaction(
   } else if (tx.fixedFreightRate !== null) {
     M = new Decimal(tx.fixedFreightRate);
   } else if (tx.distanceKm === null) {
-    if (isMasterDefaultZeroBranch) {
-      M = new Decimal(0);
-    } else {
-      M = null;
-      blocked = true;
-      blockedReason = "ไม่มีระยะทางในไฟล์ master — ต้องกรอกระยะทางหรือติ๊ก 1สาย1สู้/ทางผ่านก่อน";
-    }
+    M = null;
+    blocked = true;
+    blockedReason = "ไม่มีระยะทางในข้อมูล master — ต้องกรอกระยะทางหรือติ๊ก 1สาย1สู้/ทางผ่านก่อน";
   } else {
     const rate = lookupFreightRate(tx.distanceKm, freightTiers);
     if (rate === FREIGHT_BLOCK) {
-      if (isMasterDefaultZeroBranch) {
-        flags.push(`ระยะทาง ${tx.distanceKm} กม. ไม่อยู่ในตารางค่าขนส่ง — ใช้ M=0 โดยดีฟอลต์ (ต้องตรวจสอบ)`);
-        M = new Decimal(0);
-      } else {
-        M = null;
-        blocked = true;
-        blockedReason = `ระยะทาง ${tx.distanceKm} กม. เกิน 209 กม. หรือไม่อยู่ในตารางค่าขนส่ง — ต้องระบุค่าขนส่ง/ลิตรเองก่อน`;
-      }
+      M = null;
+      blocked = true;
+      blockedReason = `ระยะทาง ${tx.distanceKm} กม. เกิน 209 กม. หรือไม่อยู่ในตารางค่าขนส่ง — ต้องระบุค่าขนส่ง/ลิตรเองก่อน`;
     } else {
       M = new Decimal(rate);
     }

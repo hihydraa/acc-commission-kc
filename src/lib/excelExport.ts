@@ -1,6 +1,16 @@
 import ExcelJS from "exceljs";
 import type { BranchConfig } from "@/branches/types";
 import type { TransactionCalcResult } from "./calc/commissionEngine";
+import { SHARED_THRESHOLDS, SHARED_RATE_PER_LITER, SHARED_PENALTY_NEGATIVE_Q_ENABLED, SHARED_TEAM_SPLIT, DELIVERY_ROUTE_RULE } from "./calc/channelRules";
+
+/** Supplied per calculation run (periods change monthly — no longer baked
+ *  into BranchConfig, see branches/types.ts). */
+export interface PeriodInfo {
+  periodLabel: string; // e.g. "8/69"
+  periodLabelThai: string; // e.g. "ส.ค. 2569"
+  arAsOfLabel: string; // e.g. "7 ก.ย.69" — the debtor report's as-of date, as printed
+  confirmDateLabel: string; // e.g. "18 ก.ย.69" — when the confirmation page was submitted
+}
 
 /**
  * Emits the workbook using live Excel formulas (VLOOKUP/IFS/IFERROR/
@@ -74,6 +84,10 @@ export interface SheetScope {
 
 export interface BuildWorkbookInput {
   branch: BranchConfig;
+  period: PeriodInfo;
+  /** resolved at request time from the branch's Google Sheet tab (plus
+   *  anyone new confirmed this run) — no longer a hardcoded branch field */
+  roster: string[];
   truckLabels: string[];
   truckScopes: Map<string, SheetScope>;
   rows: ExportTransactionRow[];
@@ -102,25 +116,24 @@ function productLabel(code: string): string {
   return PRODUCT_NAME_BY_CODE[code] ?? code;
 }
 
-/** A branch can be a hybrid (สามทอง: flat rules for regular trucks + a
- *  departments entry for กรอกหลังปั๊ม) — these two pieces are independent,
- *  not mutually exclusive, so both must be described when both are present
- *  or a summary line would silently omit the regular-truck rule entirely.
- *  The flat-only phrasing matches the approved reference workbook's own
- *  wording exactly — a branch with no departments at all (a plain flat
- *  model) produces the identical string it always did. The reference uses
- *  "L" in the ค่าคอมรวม header but "ลิตร" in the ใบปะหน้า note for the same
- *  rule — an inconsistency in the approved file itself, not a typo to
- *  "fix" — so the unit word is a parameter, not hardcoded. */
-function qtyRuleDescription(branch: BranchConfig, unit: "L" | "ลิตร"): string {
-  const parts: string[] = [];
-  if (branch.minQtyLiters !== undefined) {
-    parts.push(`>=${branch.minQtyLiters.toLocaleString()}${unit}${branch.requireExactMultiple ? " และลงท้ายพันพอดี" : ""}`);
+/** Describes every DISTINCT qty rule actually in play this run (channel
+ *  rules are shared across branches, but a run can still mix รถขนส่ง and
+ *  กรอกหลังปั๊ม scopes) — deduped so a normal run (every sheet using the
+ *  same "กลุ่มรถขนส่ง" rule) prints one clause, not one per truck sheet.
+ *  The reference uses "L" in the ค่าคอมรวม header but "ลิตร" in the
+ *  ใบปะหน้า note for the same rule — an inconsistency in the approved file
+ *  itself, not a typo to "fix" — so the unit word is a parameter. */
+function qtyRuleDescription(truckScopes: Map<string, SheetScope>, unit: "L" | "ลิตร"): string {
+  const seen = new Map<string, string>();
+  for (const scope of truckScopes.values()) {
+    const key = `${scope.minQtyLiters}|${scope.requireExactMultiple}|${scope.qtyMultipleOf}|${scope.fixedFreightRate}`;
+    if (seen.has(key)) continue;
+    seen.set(
+      key,
+      `>=${scope.minQtyLiters.toLocaleString()}${unit}${scope.requireExactMultiple ? " และลงท้ายพันพอดี" : ""}${scope.fixedFreightRate !== null ? ` (ค่าขนส่ง/ลิตร คงที่ ${scope.fixedFreightRate} บาท)` : ""}`
+    );
   }
-  if (branch.departments) {
-    parts.push(...branch.departments.map((d) => `${d.label} >=${d.minQtyLiters.toLocaleString()}${unit}`));
-  }
-  return parts.join(" | ");
+  return [...seen.values()].join(" | ");
 }
 
 // Passes the date through exactly as the source PDF prints it
@@ -182,19 +195,18 @@ const BLOCK_SENTINEL = "ต้องตรวจสอบระยะทาง(M
 
 /**
  * scope.fixedFreightRate overrides the distance-table lookup entirely (e.g.
- * กระนวน B3's fixed 0.10) — still a live formula so the 1สาย1สู้ tag keeps
- * working. Otherwise, on a missing/out-of-range distance:
- *  - "defaultZero" (สามทอง's approved template behavior): fall through to 0.
- *  - "block" (กระนวน's confirmed v2 spec): surface the BLOCK_SENTINEL text
- *    instead of guessing — IFERROR/text-propagation carries that sentinel
- *    through N/O/P/Q automatically (any arithmetic on text errors out, and
- *    every downstream cell here is already wrapped in IFERROR(...,"")).
+ * กรอกหลังปั๊ม's fixed 0.10) — still a live formula so the 1สาย1สู้ tag keeps
+ * working. Otherwise, on a missing/out-of-range distance, every branch now
+ * surfaces the BLOCK_SENTINEL text instead of guessing 0 (see
+ * commissionEngine.ts's 2026-09-18 note) — IFERROR/text-propagation carries
+ * that sentinel through N/O/P/Q automatically (arithmetic on text errors
+ * out, and every downstream cell here is already wrapped in IFERROR(...,"")).
  */
-function freightFormula(r: number, scope: SheetScope, freightMissingBehavior: "defaultZero" | "block"): string {
+function freightFormula(r: number, scope: SheetScope): string {
   if (scope.fixedFreightRate !== null) {
     return `IF(H${r}="1สาย1สู้",0,${scope.fixedFreightRate})`;
   }
-  const missingFallback = freightMissingBehavior === "block" ? `"${BLOCK_SENTINEL}"` : "0";
+  const missingFallback = `"${BLOCK_SENTINEL}"`;
   return (
     `IF(H${r}="1สาย1สู้",0,IF(G${r}="",${missingFallback},IFERROR(_xlfn.IFS(` +
     `AND(G${r}>=20,G${r}<=59),0.15,AND(G${r}>=60,G${r}<=69),0.17,` +
@@ -208,11 +220,11 @@ function freightFormula(r: number, scope: SheetScope, freightMissingBehavior: "d
   );
 }
 
-function commissionFormula(r: number, branch: BranchConfig, scope: SheetScope): string {
-  const rosterCheck = branch.salespersonRoster.map((name) => `S${r}<>"${name}"`).join(",");
-  const penalty = branch.penaltyNegativeQEnabled ? `-I${r}*${branch.ratePerLiter}` : "0";
+function commissionFormula(r: number, roster: string[], scope: SheetScope): string {
+  const rosterCheck = roster.map((name) => `S${r}<>"${name}"`).join(",");
+  const penalty = SHARED_PENALTY_NEGATIVE_Q_ENABLED ? `-I${r}*${SHARED_RATE_PER_LITER}` : "0";
   const tier = (label: string, threshold: number) =>
-    `IF(R${r}="${label}",IF(Q${r}>=${threshold},I${r}*${branch.ratePerLiter},IF(Q${r}>=0,0,${penalty}))`;
+    `IF(R${r}="${label}",IF(Q${r}>=${threshold},I${r}*${SHARED_RATE_PER_LITER},IF(Q${r}>=0,0,${penalty}))`;
   const qtyGate = scope.requireExactMultiple
     ? `OR(I${r}<${scope.minQtyLiters},MOD(I${r},${scope.qtyMultipleOf})<>0)`
     : `I${r}<${scope.minQtyLiters}`;
@@ -220,16 +232,11 @@ function commissionFormula(r: number, branch: BranchConfig, scope: SheetScope): 
     `IFERROR(IF(OR(I${r}="",R${r}=""),0,` +
     `IF(${qtyGate},0,` +
     `IF(AND(${rosterCheck}),0,` +
-    `${tier("ขายสด", branch.thresholds.cash)},` +
-    `${tier("ขายเชื่อ", branch.thresholds.credit)},` +
-    `${tier("ลูกหนี้ค้างชำระ", branch.thresholds.overdue)},` +
+    `${tier("ขายสด", SHARED_THRESHOLDS.cash)},` +
+    `${tier("ขายเชื่อ", SHARED_THRESHOLDS.credit)},` +
+    `${tier("ลูกหนี้ค้างชำระ", SHARED_THRESHOLDS.overdue)},` +
     `"ตรวจสอบประเภท(R)")))))),0)`;
-  // The M-column block check only matters for a "block" branch (กระนวน) —
-  // สามทอง's M never produces that sentinel (freightMissingBehavior:
-  // "defaultZero"), so wrapping its formula in a check that can never
-  // trigger would just be needless noise next to the approved reference
-  // workbook's own (shorter) formula text.
-  return branch.freightMissingBehavior === "block" ? `IF(M${r}="${BLOCK_SENTINEL}","${BLOCK_SENTINEL}",${base})` : base;
+  return `IF(M${r}="${BLOCK_SENTINEL}","${BLOCK_SENTINEL}",${base})`;
 }
 
 const HIGHLIGHT_FILL: ExcelJS.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
@@ -329,12 +336,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     sheet.addRow(TRUCK_HEADER);
     styleHeaderRow(sheet.getRow(1), TRUCK_HEADER.length);
 
-    const scope = input.truckScopes.get(truckLabel) ?? {
-      minQtyLiters: branch.minQtyLiters ?? 0,
-      requireExactMultiple: branch.requireExactMultiple ?? false,
-      qtyMultipleOf: branch.qtyMultipleOf ?? 1000,
-      fixedFreightRate: null,
-    };
+    const scope = input.truckScopes.get(truckLabel) ?? DELIVERY_ROUTE_RULE;
 
     const deptRows = input.rows.filter((r) => r.truckLabel === truckLabel);
     deptRows.forEach((r, idx) => {
@@ -342,7 +344,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       const noteParts = [...r.calc.flags];
       if (r.calc.blockedReason) noteParts.push(r.calc.blockedReason);
       if (r.meterAnnotation) noteParts.push(`หมายเหตุจากไฟล์ขาย: "${r.meterAnnotation}" — ต้องยืนยันกับผู้ใช้ว่านับเป็นยอดเซลล์จริงหรือไม่`);
-      if (r.outstandingAmount !== null) noteParts.push(`หักหนี้ค้างชำระ ฿${r.outstandingAmount.toLocaleString()} — พบในรายงานลูกหนี้ ณ ${branch.arAsOfLabel}`);
+      if (r.outstandingAmount !== null) noteParts.push(`หักหนี้ค้างชำระ ฿${r.outstandingAmount.toLocaleString()} — พบในรายงานลูกหนี้ ณ ${input.period.arAsOfLabel}`);
 
       const gVal = r.distanceKm ?? "";
       const hVal = r.masterTag || "";
@@ -362,14 +364,14 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
         r.saleValue,
         r.cost,
         fv(`IFERROR(J${excelRow}-K${excelRow},"")`, r.calc.grossProfit),
-        fv(freightFormula(excelRow, scope, branch.freightMissingBehavior), mVal),
+        fv(freightFormula(excelRow, scope), mVal),
         fv(`IFERROR(M${excelRow}*I${excelRow},"")`, r.calc.freightTotal ?? ""),
         fv(`IFERROR(N${excelRow}+K${excelRow},"")`, r.calc.totalCost ?? ""),
         fv(`IFERROR(J${excelRow}-O${excelRow},"")`, r.calc.profitAfterFreight ?? ""),
         fv(`IFERROR(P${excelRow}/I${excelRow},"")`, r.calc.profitPerLiter ?? ""),
         fv(`IF(LEFT(C${excelRow},1)="H","ขายสด",IF(LEFT(C${excelRow},1)="I","ขายเชื่อ","ตรวจสอบ"))`, saleTypeLabel(r.saleType)),
         fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,2,FALSE()),"ตรวจสอบเซลล์")`, sVal),
-        fv(commissionFormula(excelRow, branch, scope), r.calc.commission),
+        fv(commissionFormula(excelRow, input.roster, scope), r.calc.commission),
         noteParts.join("; "),
       ]);
       styleDataRowBorders(sheet.getRow(excelRow), TRUCK_HEADER.length);
@@ -410,11 +412,13 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   const debtSheet = workbook.addWorksheet(safeSheetName("หักหนี้ค้างชำระ", usedSheetNames));
 
   // ---------- หักหนี้ค้างชำระ ----------
+  // Deduction is always applied automatically now (สามทอง/กระนวน's old
+  // "auto" vs "flagOnly" split is gone — กระนวน was already overridden to
+  // "auto" by explicit user confirmation before this unification, so this
+  // is not a behavior change for either existing branch).
   debtSheet.mergeCells(1, 1, 1, 9);
   debtSheet.getCell("A1").value =
-    branch.debtDeductionMode === "auto"
-      ? `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} (ทุกชนิดน้ำมันที่เข้าเกณฑ์) — บิลที่จ่ายมาบางส่วนแล้ว คิดเฉพาะสัดส่วนที่ยังค้างเท่านั้น ไม่ใช่เต็มบิล`
-      : `ลูกหนี้ ณ ${branch.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} — รายการนี้เป็น "การแจ้งเตือน" เท่านั้น ยังไม่ได้หักออกจากค่าคอมสุทธิ (ดูชีทค่าคอมรวม คอลัมน์ "หนี้ค้างที่ต้องพิจารณา" ที่ตั้งต้น 0) บัญชีต้องพิจารณาหักเอง 50%/100% ตาม policy ข้อ 6-7`;
+    `ลูกหนี้ ณ ${input.period.arAsOfLabel} ที่ยังไม่จ่ายชำระ ตรงกับรายการที่เข้าเกณฑ์ค่าคอมเดือน ${input.period.periodLabel} (ทุกชนิดน้ำมันที่เข้าเกณฑ์) — บิลที่จ่ายมาบางส่วนแล้ว คิดเฉพาะสัดส่วนที่ยังค้างเท่านั้น ไม่ใช่เต็มบิล`;
   debtSheet.getRow(1).font = { bold: true, size: 13 };
   const DEBT_HEADER = [
     "รหัสลูกค้า",
@@ -423,8 +427,8 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     "วันที่",
     "ลิตรที่ค้าง (เฉพาะส่วนที่ยังไม่จ่าย)",
     "เซลล์",
-    branch.debtDeductionMode === "auto" ? "ค่าคอมที่หัก (เฉพาะส่วนที่ยังค้าง)" : "ค่าคอมของส่วนที่ยังค้าง (บาท) — อ้างอิงเท่านั้น",
-    `ยอดคงค้าง (บาท) ตามรายงานลูกหนี้ ${branch.arAsOfLabel}`,
+    "ค่าคอมที่หัก (เฉพาะส่วนที่ยังค้าง)",
+    `ยอดคงค้าง (บาท) ตามรายงานลูกหนี้ ${input.period.arAsOfLabel}`,
     "สถานะการจ่าย",
   ];
   debtSheet.addRow(DEBT_HEADER);
@@ -457,64 +461,50 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   const debtInformationalTotal = debtRows.reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
   if (debtRows.length > 0) {
     debtSheet.addRow([]);
-    debtSheet.getCell(`A${debtDataLast + 2}`).value = branch.debtDeductionMode === "auto" ? "รวมลิตรที่ต้องหัก" : "รวมลิตรที่เกี่ยวข้อง";
+    debtSheet.getCell(`A${debtDataLast + 2}`).value = "รวมลิตรที่ต้องหัก";
     debtSheet.getCell(`B${debtDataLast + 2}`).value = fv(`SUM(E3:E${debtDataLast})`, input.debtQtyTotal);
-    debtSheet.getCell(`A${debtDataLast + 3}`).value = branch.debtDeductionMode === "auto" ? "รวมค่าคอมที่ต้องหัก" : "รวมค่าคอมของรายการที่ต้องพิจารณา (อ้างอิงเท่านั้น — ยังไม่ได้หัก)";
+    debtSheet.getCell(`A${debtDataLast + 3}`).value = "รวมค่าคอมที่ต้องหัก";
     debtSheet.getCell(`B${debtDataLast + 3}`).value = fv(`SUM(G3:G${debtDataLast})`, debtInformationalTotal);
     styleTotalRow(debtSheet.getRow(debtDataLast + 2), 2);
     styleTotalRow(debtSheet.getRow(debtDataLast + 3), 2);
     const noteStart = debtDataLast + 5;
     debtSheet.getCell(`A${noteStart}`).value = "หมายเหตุ:";
     debtSheet.getCell(`A${noteStart + 1}`).value =
-      `- วิธีจับคู่: เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือน ${branch.periodLabel} กับเอกสารที่ยังคงค้างในรายงานลูกหนี้คงค้างแบบละเอียด ณ วันที่ ${branch.arAsOfLabel}`;
+      `- วิธีจับคู่: เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือน ${input.period.periodLabel} กับเอกสารที่ยังคงค้างในรายงานลูกหนี้คงค้างแบบละเอียด ณ วันที่ ${input.period.arAsOfLabel}`;
     debtSheet.getCell(`A${noteStart + 2}`).value = `- พบ ${debtRows.length} รายการที่ตรงกัน:`;
     debtRows.forEach((r, i) => {
       debtSheet.getCell(`A${noteStart + 3 + i}`).value =
         `    ${i + 1}) ${r.customerCode} ${r.customerName} เอกสาร ${r.docNo} (${productLabel(r.productCode)} ${r.qty.toLocaleString()} ลิตร) ยอดคงค้าง ${(r.arOutstandingReference ?? 0).toLocaleString()} บาท`;
     });
-    if (branch.debtDeductionMode === "auto") {
-      debtSheet.getCell(`A${noteStart + 3 + debtRows.length}`).value =
-        "- ค่าคอมของแต่ละรายการคำนวณจากสูตรเดียวกับชีทรถ (ตามลิตรจริงของรายการนั้น) ไม่ได้หักเป็นยอดเงินคงค้างตรงๆ — ยอดนี้ถูกหักออกจากค่าคอมสุทธิของเซลล์แล้ว (ดูชีทค่าคอมรวม)";
-    } else {
-      debtSheet.getCell(`A${noteStart + 3 + debtRows.length}`).value =
-        "- รายการข้างต้นเป็นการแจ้งเตือนเท่านั้น — ยังไม่ได้หักออกจากค่าคอมสุทธิ (ชีทค่าคอมรวมตั้งค่าคอลัมน์นี้ไว้ที่ 0) บัญชีต้องพิจารณาหักเอง 50% ถ้ายังไม่จ่าย หรือ 100% ถ้าตกลงผ่อนตามตารางที่กำหนด ตาม policy ข้อ 6-7 แล้วกรอกยอดหักเข้าชีทค่าคอมรวมด้วยมือ";
-    }
+    debtSheet.getCell(`A${noteStart + 3 + debtRows.length}`).value =
+      "- ค่าคอมของแต่ละรายการคำนวณจากสูตรเดียวกับชีทรถ (ตามลิตรจริงของรายการนั้น) ไม่ได้หักเป็นยอดเงินคงค้างตรงๆ — ยอดนี้ถูกหักออกจากค่าคอมสุทธิของเซลล์แล้ว (ดูชีทค่าคอมรวม)";
   } else {
     debtSheet.addRow(["ไม่พบรายการค้างชำระที่ตรงกับรายการเข้าเกณฑ์เดือนนี้"]);
   }
   [13, 30, 15, 10, 22, 10, 20, 26].forEach((w, i) => (debtSheet.getColumn(i + 1).width = w));
 
   // ---------- ค่าคอมรวม ----------
-  const qtyColumnLabel = `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ ${qtyRuleDescription(branch, "L")} ทุกชนิดน้ำมัน)`;
-  const debtColumnLabel =
-    branch.debtDeductionMode === "auto"
-      ? "หักค่าคอมจากหนี้ค้างชำระ"
-      : "หนี้ค้างที่ต้องพิจารณา (บาท) — บัญชีปรับเอง ตั้งต้น 0";
+  const qtyColumnLabel = `จำนวนลิตร (รวมรายการที่เข้าเกณฑ์ ${qtyRuleDescription(input.truckScopes, "L")} ทุกชนิดน้ำมัน)`;
+  const debtColumnLabel = "หักค่าคอมจากหนี้ค้างชำระ";
   const SUMMARY_HEADER = ["เซลล์", qtyColumnLabel, "ค่าคอมมิชชั่นรวม (ก่อนหักหนี้)", debtColumnLabel, "ค่าคอมสุทธิ"];
   summarySheet.addRow(SUMMARY_HEADER);
   styleHeaderRow(summarySheet.getRow(1), SUMMARY_HEADER.length);
-  const perSalesperson = branch.salespersonRoster.map((name) => {
+  const perSalesperson = input.roster.map((name) => {
     const rows = input.rows.filter((r) => r.salesperson === name);
     const liters = rows.filter((r) => r.calc.qualifiesByQty).reduce((s, r) => s + r.qty, 0);
     const gross = rows.reduce((s, r) => s + r.calc.commissionNumeric, 0);
-    const flaggedDebt = debtRows.filter((r) => r.salesperson === name).reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
-    // "auto" (สามทอง): matched debt is actually netted out of ค่าคอมสุทธิ.
-    // "flagOnly" (กระนวน): the full amount is only LISTED for accounting's
-    // own manual 50%/100% review (policy §6-7) — the applied deduction that
-    // feeds into ค่าคอมสุทธิ stays 0, matching the branch's own approved
-    // reference workbook exactly (its ค่าคอมรวม sheet's debt column is a
-    // literal 0, not a formula, precisely so accounting can safely
-    // overwrite it by hand without a live formula clobbering their edit).
-    const debt = branch.debtDeductionMode === "auto" ? flaggedDebt : 0;
-    return { name, liters, gross, debt, flaggedDebt, net: gross - debt };
+    // matched debt is netted out of ค่าคอมสุทธิ automatically for every
+    // branch now (see the หักหนี้ค้างชำระ section comment above)
+    const debt = debtRows.filter((r) => r.salesperson === name).reduce((s, r) => s + (r.outstandingAmount ?? 0), 0);
+    return { name, liters, gross, debt, net: gross - debt };
   });
-  branch.salespersonRoster.forEach((name, i) => {
+  input.roster.forEach((name, i) => {
     const r = i + 2;
     const agg = perSalesperson[i];
     const qtyTerms = input.truckLabels.map((label) => {
       const s = truckSheetNameByLabel.get(label)!;
       const last = truckLastRow.get(label) ?? 1;
-      const sc = input.truckScopes.get(label) ?? { minQtyLiters: branch.minQtyLiters ?? 0, requireExactMultiple: branch.requireExactMultiple ?? false, qtyMultipleOf: branch.qtyMultipleOf ?? 1000, fixedFreightRate: null };
+      const sc = input.truckScopes.get(label) ?? DELIVERY_ROUTE_RULE;
       const qtyCond = sc.requireExactMultiple
         ? `('${s}'!$I$2:$I$${last}>=${sc.minQtyLiters})*(MOD('${s}'!$I$2:$I$${last},${sc.qtyMultipleOf})=0)`
         : `('${s}'!$I$2:$I$${last}>=${sc.minQtyLiters})`;
@@ -525,14 +515,11 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
       const last = truckLastRow.get(label) ?? 1;
       return `SUMIF('${s}'!$S$2:$S$${last},$A${r},'${s}'!$T$2:$T$${last})`;
     });
-    const debtCell =
-      branch.debtDeductionMode === "auto"
-        ? fv(`SUMIF(หักหนี้ค้างชำระ!$F:$F,$A${r},หักหนี้ค้างชำระ!$G:$G)`, agg.debt)
-        : 0; // literal, not a formula — see comment on `perSalesperson` above
+    const debtCell = fv(`SUMIF(หักหนี้ค้างชำระ!$F:$F,$A${r},หักหนี้ค้างชำระ!$G:$G)`, agg.debt);
     summarySheet.addRow([name, fv(qtyTerms.join("+"), agg.liters), fv(commTerms.join("+"), agg.gross), debtCell, fv(`C${r}-D${r}`, agg.net)]);
     styleDataRowBorders(summarySheet.lastRow!, SUMMARY_HEADER.length);
   });
-  const grandRow = branch.salespersonRoster.length + 2;
+  const grandRow = input.roster.length + 2;
   summarySheet.getRow(grandRow).getCell(1).value = "รวมทั้งหมด";
   const grandTotals = {
     liters: perSalesperson.reduce((s, a) => s + a.liters, 0),
@@ -549,25 +536,20 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
 
   // ---------- ใบปะหน้า ----------
   const coverSheet = workbook.addWorksheet(safeSheetName("ใบปะหน้า", usedSheetNames));
-  coverSheet.mergeCells(1, 1, 1, branch.teamSplit.roles.length + 2);
-  coverSheet.getCell("A1").value = `สรุปค่าคอมมิชชั่นฝ่ายการตลาด สาขา${branch.label} - เดือน ${branch.periodLabel} (${branch.periodLabelThai})`;
+  coverSheet.mergeCells(1, 1, 1, SHARED_TEAM_SPLIT.roles.length + 2);
+  coverSheet.getCell("A1").value = `สรุปค่าคอมมิชชั่นฝ่ายการตลาด สาขา${branch.label} - เดือน ${input.period.periodLabel} (${input.period.periodLabelThai})`;
   coverSheet.getRow(1).font = { bold: true, size: 13 };
-  // Every exclusion list that could apply anywhere in this branch — the
-  // flat/regular-truck one plus every department's own (see
-  // DepartmentConfig.excludedCustomers) — just for this one summary line;
-  // the actual per-row exclusion check elsewhere is properly channel-scoped.
-  const allExcludedCustomers = [...branch.excludedCustomers, ...(branch.departments?.flatMap((d) => d.excludedCustomers) ?? [])];
-  coverSheet.mergeCells(3, 1, 3, branch.teamSplit.roles.length + 2);
+  coverSheet.mergeCells(3, 1, 3, SHARED_TEAM_SPLIT.roles.length + 2);
   coverSheet.getCell("A3").value =
-    `หมายเหตุ: อัตราแบ่ง ${branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${[...new Set(branch.fuelProductCodes.map(productLabel))].join("+")} ที่ ${qtyRuleDescription(branch, "ลิตร")} | ไม่รวมลูกค้า${allExcludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
+    `หมายเหตุ: อัตราแบ่ง ${SHARED_TEAM_SPLIT.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`).join(" / ")} | เข้าเกณฑ์ =${[...new Set(branch.fuelProductCodes.map(productLabel))].join("+")} ที่ ${qtyRuleDescription(input.truckScopes, "ลิตร")} | ไม่รวมลูกค้า${branch.excludedCustomers.map((e) => ` ${e.customerName} (${e.reason})`).join(", ")}`;
 
   const splitHeaderRow = 5;
-  const coverColCount = branch.teamSplit.roles.length + 2;
+  const coverColCount = SHARED_TEAM_SPLIT.roles.length + 2;
   const colLetterForRoleIdx = (i: number) => String.fromCharCode("C".charCodeAt(0) + i);
-  coverSheet.getRow(splitHeaderRow).values = ["เจ้าของยอด (เซลล์)", "ค่าคอมสุทธิ (บาท)", ...branch.teamSplit.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`)];
+  coverSheet.getRow(splitHeaderRow).values = ["เจ้าของยอด (เซลล์)", "ค่าคอมสุทธิ (บาท)", ...SHARED_TEAM_SPLIT.roles.map((r) => `${r.label} ${(r.percent * 100).toFixed(0)}%`)];
   styleHeaderRow(coverSheet.getRow(splitHeaderRow), coverColCount);
   const roleTotalsByCol = new Map<number, number>(); // 1-indexed column -> sum, for the รวม row
-  branch.salespersonRoster.forEach((name, i) => {
+  input.roster.forEach((name, i) => {
     const srcRow = i + 2; // ค่าคอมรวม row for this salesperson
     const outRow = splitHeaderRow + 1 + i;
     const net = perSalesperson[i].net;
@@ -576,18 +558,18 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
 
     const shares: number[] = [];
     let fixedSum = 0;
-    branch.teamSplit.roles.forEach((role) => {
+    SHARED_TEAM_SPLIT.roles.forEach((role) => {
       if (role.isRemainder) return;
       const amt = Math.round(net * role.percent * 100) / 100;
       shares.push(amt);
       fixedSum += amt;
     });
     let fixedIdx = 0;
-    branch.teamSplit.roles.forEach((role, roleIdx) => {
+    SHARED_TEAM_SPLIT.roles.forEach((role, roleIdx) => {
       const col = roleIdx + 3; // C, D, E, ...
       if (role.isRemainder) {
         const remainder = Math.round((net - fixedSum) * 100) / 100;
-        const otherCols = branch.teamSplit.roles
+        const otherCols = SHARED_TEAM_SPLIT.roles
           .map((_, j) => j)
           .filter((j) => j !== roleIdx)
           .map((j) => colLetterForRoleIdx(j) + outRow);
@@ -602,9 +584,9 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     coverSheet.addRow(cells);
     styleDataRowBorders(coverSheet.lastRow!, coverColCount);
   });
-  const totalRow = splitHeaderRow + 1 + branch.salespersonRoster.length;
+  const totalRow = splitHeaderRow + 1 + input.roster.length;
   const totalCells: (string | { formula: string; result?: number | string })[] = ["รวม"];
-  for (let c = 2; c <= branch.teamSplit.roles.length + 2; c++) {
+  for (let c = 2; c <= SHARED_TEAM_SPLIT.roles.length + 2; c++) {
     const col = String.fromCharCode("A".charCodeAt(0) + c - 1);
     totalCells.push(fv(`SUM(${col}${splitHeaderRow + 1}:${col}${totalRow - 1})`, roleTotalsByCol.get(c) ?? 0));
   }
@@ -639,43 +621,25 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   };
 
   notesSheet.mergeCells(1, 1, 1, 2);
-  addTitle(`หมายเหตุและข้อสมมติฐานในการคำนวณค่าคอม ${branch.id.toUpperCase()} เดือน ${branch.periodLabel}`);
+  addTitle(`หมายเหตุและข้อสมมติฐานในการคำนวณค่าคอม ${branch.id.toUpperCase()} เดือน ${input.period.periodLabel}`);
 
   addSectionHeader("1) ขอบเขตข้อมูลที่ใช้");
-  addLine(`- ไฟล์ยอดขายรายรถ: ${input.truckLabels.join(", ")} (ทั้งหมดในโฟลเดอร์ ${branch.dataFolderLabel})`);
-  addLine(`- ไฟล์ระยะทาง/เซลล์: '${branch.masterFileLabel}'`);
-  addLine(`- ไฟล์ลูกหนี้คงค้าง: รายงานลูกหนี้คงค้างแบบละเอียด ณ ${branch.arAsOfLabel}`);
+  addLine(`- ไฟล์ยอดขาย: ${input.truckLabels.join(", ")}`);
+  addLine(`- ระยะทาง/เซลล์/ชื่อลูกค้า: Google Sheet 'Commission_Distance_Seller' แท็บ '${branch.sheetTabName}' (ยืนยัน/แก้ไขผ่านหน้ายืนยันก่อนคำนวณ)`);
+  addLine(`- ไฟล์ลูกหนี้คงค้าง: รายงานลูกหนี้คงค้างแบบละเอียด ณ ${input.period.arAsOfLabel}`);
   blank();
 
   addSectionHeader("2) เกณฑ์การกรองรายการที่เข้าเกณฑ์ค่าคอม");
   addLine(`- รวมน้ำมันใสทุกชนิด: ${[...new Set(branch.fuelProductCodes.map(productLabel))].join(", ")}`);
-  if (branch.minQtyLiters !== undefined) {
-    addLine(
-      `- รถทั่วไป: ปริมาณขายสุทธิต้อง >= ${branch.minQtyLiters.toLocaleString()} ลิตร ต่อ 1 เอกสาร${branch.requireExactMultiple ? ` 'และ' ต้องลงท้ายพันพอดี (หาร ${(branch.qtyMultipleOf ?? 0).toLocaleString()} ลงตัว) — เช่น 2,000/3,000/4,000 เข้าเกณฑ์ แต่ 2,500 ไม่เข้าเกณฑ์เลยทั้งบิล` : ""}`
-    );
-  }
-  if (branch.departments) {
-    addLine("- แยกตามแผนก (จัดประเภทจาก \"เลือกแผนก\" ในไฟล์ ไม่ใช่ชื่อไฟล์) ปริมาณขายสุทธิต้อง >= เกณฑ์ขั้นต่ำของแผนกนั้น ต่อ 1 เอกสาร (ไม่มีเงื่อนไขต้องลงท้ายพันพอดี):");
-    for (const d of branch.departments) {
-      addLine(`    ${d.label} (${d.code}): >= ${d.minQtyLiters.toLocaleString()} ลิตร${d.fixedFreightRate !== null ? ` · ค่าขนส่ง/ลิตร คงที่ ${d.fixedFreightRate} บาท` : ""}${d.fixedSalesperson ? ` · เซลล์คงที่ "${d.fixedSalesperson}"` : ""}`);
-    }
-  }
+  addLine(`- ปริมาณขายสุทธิต้อง >= ${qtyRuleDescription(input.truckScopes, "ลิตร")} ต่อ 1 เอกสาร (กฎเดียวกันทุกสาขา ทุกช่องทาง — ไม่มีเงื่อนไขต้องลงท้ายพันพอดี)`);
   addLine("- ชีทรถแต่ละคันแสดงทุกแถวของทุกชนิดสินค้า (รวมแถวที่ไม่เข้าเกณฑ์ไว้เพื่อการตรวจสอบ) — คอลัมน์ 'ค่าคอม' เป็น 0 อัตโนมัติถ้าไม่เข้าเกณฑ์");
   addLine("- ไม่ได้ตรวจการรวมบิลย่อยที่ต่ำกว่าเกณฑ์ของลูกค้ารายเดียวกันในวันเดียวกัน หากพบควรให้ผู้ใช้ยืนยันก่อนรวมบิล");
   blank();
 
   addSectionHeader("3) ลูกค้าที่ตัดออกจากค่าคอมการตลาด");
-  // Exclusion is channel-scoped (branch-flat for รถทั่วไป vs each
-  // department's own list — see DepartmentConfig.excludedCustomers), so
-  // each entry is labeled with which channel it applies to rather than
-  // implying a single branch-wide list.
-  const scopedExclusions = [
-    ...branch.excludedCustomers.map((e) => ({ ...e, scope: "รถทั่วไป" })),
-    ...(branch.departments?.flatMap((d) => d.excludedCustomers.map((e) => ({ ...e, scope: d.label }))) ?? []),
-  ];
-  if (scopedExclusions.length === 0) addLine("- ไม่มี");
-  for (const e of scopedExclusions) {
-    addLine(`- [${e.scope}] ${e.customerCode} ${e.customerName} — ${e.reason} จึงตัดออกทั้งหมด (ยืนยันจากผู้ใช้ ${branch.confirmDateLabel})`);
+  if (branch.excludedCustomers.length === 0) addLine("- ไม่มี");
+  for (const e of branch.excludedCustomers) {
+    addLine(`- ${e.customerCode} ${e.customerName} — ${e.reason} จึงตัดออกทั้งหมด`);
   }
   const meterAnnotated = [...new Map(input.rows.filter((r) => r.meterAnnotation && r.calc.qualifiesByQty).map((r) => [r.customerCode, r])).values()];
   for (const r of meterAnnotated) {
@@ -689,30 +653,18 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   addSectionHeader("4) ประเภท (ขายสด/ขายเชื่อ)");
   addLine("- ใช้กฎ: เลขที่เอกสารขึ้นต้นด้วย H = ขายสด, ขึ้นต้นด้วย I = ขายเชื่อ (ไม่ใช่ 100% แน่นอน — ควรสุ่มตรวจกับระบบบัญชีเป็นระยะ)");
   addLine(
-    `- เกณฑ์กำไรต่อลิตร (ขายสด>=${(branch.thresholds.cash * 100).toFixed(0)}สต./ลิตร, ขายเชื่อ>=${(branch.thresholds.credit * 100).toFixed(0)}สต./ลิตร, ค้างชำระ>=${(branch.thresholds.overdue * 100).toFixed(0)}สต./ลิตร, อัตรา ${(branch.ratePerLiter * 100).toFixed(0)}สต./ลิตร) ใช้เกณฑ์เดียวกันทุกชนิดน้ำมัน`
+    `- เกณฑ์กำไรต่อลิตร (ขายสด>=${(SHARED_THRESHOLDS.cash * 100).toFixed(0)}สต./ลิตร, ขายเชื่อ>=${(SHARED_THRESHOLDS.credit * 100).toFixed(0)}สต./ลิตร, ค้างชำระ>=${(SHARED_THRESHOLDS.overdue * 100).toFixed(0)}สต./ลิตร, อัตรา ${(SHARED_RATE_PER_LITER * 100).toFixed(0)}สต./ลิตร) ใช้เกณฑ์เดียวกันทุกชนิดน้ำมัน ทุกสาขา`
   );
   blank();
 
   addSectionHeader("5) ค่าขนส่ง/ระยะทาง");
-  addLine(`- ระยะทาง(กม.) และเซลล์ต่อรหัสลูกค้า อ้างอิงจากไฟล์ '${branch.masterFileLabel}'`);
-  if (branch.masterOverrides.length > 0) {
-    addLine(
-      `- ลูกค้าที่ไม่มีในไฟล์ ${branch.masterOverrides.length} ราย ได้รับข้อมูลจากผู้ใช้โดยตรง (ทำเครื่องหมายสีเหลืองในชีท Master): ` +
-        branch.masterOverrides
-          .map((o) => `${o.customerCode}(${o.distanceKm ?? "ทางผ่าน"}กม./${o.salesperson}${o.reuseFromCustomerCode ? ` - อิงจาก ${o.reuseFromCustomerCode}` : ""})`)
-          .join(", ")
-    );
-  }
+  addLine(`- ระยะทาง(กม.), เซลล์ และชื่อลูกค้า ต่อรหัสลูกค้า อ้างอิงจาก Google Sheet แท็บ '${branch.sheetTabName}' ผ่านการยืนยัน/แก้ไขในหน้ายืนยันก่อนคำนวณรอบนี้ — ชีท Master ด้านบนคือค่าที่ยืนยันแล้วจริงที่ใช้คำนวณ ไม่ใช่ค่าดิบจากไฟล์ PDF`);
   addLine("- ลูกค้าที่มีแท็ก '1สาย1สู้' หรือ 'ทางผ่าน' (ระยะทางว่าง) ใช้ค่าขนส่ง/ลิตร = 0");
-  const missingBehaviorNote =
-    branch.freightMissingBehavior === "block"
-      ? "ค่าขนส่งจะขึ้น 'ต้องตรวจสอบระยะทาง(M)' แทนการเดา — ต้องกรอกระยะทางหรือยืนยันแท็กก่อนแถวนั้นจึงจะคำนวณค่าคอมได้"
-      : "ค่าขนส่งถูกตั้งเป็น 0 โดยดีฟอลต์ — ต้องยืนยันระยะทาง/เซลล์จริงก่อนส่งมอบ";
   const noMasterCodes = [...new Set(input.rows.filter((r) => r.calc.qualifiesByQty && !r.masterFound).map((r) => r.customerCode))];
   addLine(
     noMasterCodes.length === 0
       ? "- ทุกลูกค้าที่เข้าเกณฑ์รอบนี้มีข้อมูล master ครบแล้ว"
-      : `- ⚠ ลูกค้าที่เข้าเกณฑ์แต่ไม่พบในไฟล์ master เลยรอบนี้ (${missingBehaviorNote}): ${noMasterCodes.join(", ")}`
+      : `- ⚠ ลูกค้าที่เข้าเกณฑ์แต่ไม่พบใน Google Sheet เลยรอบนี้ (ค่าขนส่งจะขึ้น 'ต้องตรวจสอบระยะทาง(M)' แทนการเดา — ควรถูกจับที่หน้ายืนยันไปแล้วก่อนถึงขั้นตอนนี้): ${noMasterCodes.join(", ")}`
   );
   const blockedRows = input.rows.filter((r) => r.calc.blocked);
   if (blockedRows.length > 0) {
@@ -723,16 +675,12 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   }
   blank();
 
-  addSectionHeader(branch.debtDeductionMode === "auto" ? "6) การหักค่าคอมจากหนี้ที่ยังเก็บไม่ได้" : "6) หนี้ค้างที่ต้องพิจารณา (ยังไม่ได้หักอัตโนมัติ)");
+  addSectionHeader("6) การหักค่าคอมจากหนี้ที่ยังเก็บไม่ได้");
   if (input.debtQtyTotal === 0) {
-    addLine(`- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — ไม่พบรายการที่ตรงกันในรอบนี้`);
-  } else if (branch.debtDeductionMode === "auto") {
-    addLine(
-      `- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — พบรายการตรงกัน รวม ฿${debtInformationalTotal.toLocaleString()} (ดูชีท 'หักหนี้ค้างชำระ') หักค่าคอมเฉพาะรายการนั้นตามลิตรจริง`
-    );
+    addLine(`- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${input.period.arAsOfLabel} — ไม่พบรายการที่ตรงกันในรอบนี้`);
   } else {
     addLine(
-      `- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${branch.arAsOfLabel} — พบรายการตรงกัน รวม ฿${debtInformationalTotal.toLocaleString()} (ดูชีท 'หักหนี้ค้างชำระ') แต่ตาม policy ข้อ 6-7 การหัก 50%/100% เป็นดุลยพินิจของบัญชี ไม่ใช่สูตรอัตโนมัติ — ยอดนี้ **ยังไม่ได้หัก** ออกจากค่าคอมสุทธิ (คอลัมน์ 'หนี้ค้างที่ต้องพิจารณา' ในชีทค่าคอมรวมตั้งไว้ที่ 0 ให้บัญชีกรอกเองหลังพิจารณา)`
+      `- จับคู่เลขที่เอกสารของรายการที่เข้าเกณฑ์ค่าคอมเดือนนี้ กับเอกสารที่ยังค้างชำระในรายงานลูกหนี้ ณ ${input.period.arAsOfLabel} — พบรายการตรงกัน รวม ฿${debtInformationalTotal.toLocaleString()} (ดูชีท 'หักหนี้ค้างชำระ') หักค่าคอมเฉพาะรายการนั้นตามลิตรจริง`
     );
   }
   blank();

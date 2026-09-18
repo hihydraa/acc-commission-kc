@@ -4,13 +4,6 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { BRANCHES } from "@/branches";
 
-interface QtyRule {
-  minQtyLiters: number;
-  requireExactMultiple: boolean;
-  qtyMultipleOf: number;
-  fixedSalesperson?: string | null;
-}
-
 interface ExcludedCustomer {
   customerCode: string;
   customerName: string;
@@ -18,56 +11,17 @@ interface ExcludedCustomer {
 }
 
 interface SettingsResponse {
-  branch: { id: string; label: string; companyName: string; departments: { code: string; label: string }[] | null };
-  excludedCustomers: ExcludedCustomer[] | null;
-  qty: QtyRule | null;
-  departmentExcludedCustomers: Record<string, ExcludedCustomer[]> | null;
-  departmentQty: Record<string, QtyRule> | null;
+  branch: { id: string; label: string; companyName: string };
+  excludedCustomers: ExcludedCustomer[];
+  pumpFillSalesperson: string | null;
   updatedAt: string | null;
   updatedBy: string | null;
 }
 
-function ExcludedCustomerEditor({ rows, onChange }: { rows: ExcludedCustomer[]; onChange: (rows: ExcludedCustomer[]) => void }) {
-  function update(idx: number, field: keyof ExcludedCustomer, value: string) {
-    const next = [...rows];
-    next[idx] = { ...next[idx], [field]: value };
-    onChange(next);
-  }
-  function add() {
-    onChange([...rows, { customerCode: "", customerName: "", reason: "" }]);
-  }
-  function remove(idx: number) {
-    onChange(rows.filter((_, i) => i !== idx));
-  }
-
-  return (
-    <div>
-      <div className="flex items-center justify-end">
-        <button onClick={add} className="rounded bg-neutral-100 px-3 py-1 text-xs font-medium hover:bg-neutral-200">
-          + เพิ่มลูกค้า
-        </button>
-      </div>
-      <div className="mt-2 space-y-2">
-        {rows.length === 0 && <p className="text-sm text-neutral-500">ไม่มีลูกค้าที่ยกเว้น</p>}
-        {rows.map((c, idx) => (
-          <div key={idx} className="grid grid-cols-[1fr_1.2fr_1.6fr_auto] items-start gap-2">
-            <input placeholder="รหัสลูกค้า" className="rounded border border-neutral-300 px-2 py-1 text-sm" value={c.customerCode} onChange={(e) => update(idx, "customerCode", e.target.value)} />
-            <input placeholder="ชื่อลูกค้า" className="rounded border border-neutral-300 px-2 py-1 text-sm" value={c.customerName} onChange={(e) => update(idx, "customerName", e.target.value)} />
-            <input placeholder="เหตุผลที่ยกเว้น" className="rounded border border-neutral-300 px-2 py-1 text-sm" value={c.reason} onChange={(e) => update(idx, "reason", e.target.value)} />
-            <button onClick={() => remove(idx)} className="rounded px-2 py-1 text-xs text-red-700 hover:bg-red-50">
-              ลบ
-            </button>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function validateExcludedCustomers(rows: ExcludedCustomer[], label: string): string | null {
+function validateExcludedCustomers(rows: ExcludedCustomer[]): string | null {
   const codes = rows.map((c) => c.customerCode.trim().toUpperCase());
-  if (codes.some((c) => !c)) return `มีแถวลูกค้าที่ยกเว้น (${label}) ที่ยังไม่ได้กรอกรหัสลูกค้า`;
-  if (new Set(codes).size !== codes.length) return `มีรหัสลูกค้าที่ยกเว้นซ้ำกันใน ${label}`;
+  if (codes.some((c) => !c)) return "มีแถวลูกค้าที่ยกเว้นที่ยังไม่ได้กรอกรหัสลูกค้า";
+  if (new Set(codes).size !== codes.length) return "มีรหัสลูกค้าที่ยกเว้นซ้ำกัน";
   return null;
 }
 
@@ -108,14 +62,19 @@ export default function SettingsPage() {
     };
   }, [branchId]);
 
-  function updateFlatQty(field: keyof QtyRule, value: number | boolean) {
-    if (!data || !data.qty) return;
-    setData({ ...data, qty: { ...data.qty, [field]: value } });
+  function updateRow(idx: number, field: keyof ExcludedCustomer, value: string) {
+    if (!data) return;
+    const next = [...data.excludedCustomers];
+    next[idx] = { ...next[idx], [field]: value };
+    setData({ ...data, excludedCustomers: next });
   }
-
-  function updateDeptQty(code: string, field: keyof QtyRule, value: number | boolean | string) {
-    if (!data || !data.departmentQty) return;
-    setData({ ...data, departmentQty: { ...data.departmentQty, [code]: { ...data.departmentQty[code], [field]: value } } });
+  function addRow() {
+    if (!data) return;
+    setData({ ...data, excludedCustomers: [...data.excludedCustomers, { customerCode: "", customerName: "", reason: "" }] });
+  }
+  function removeRow(idx: number) {
+    if (!data) return;
+    setData({ ...data, excludedCustomers: data.excludedCustomers.filter((_, i) => i !== idx) });
   }
 
   async function handleSave() {
@@ -123,21 +82,10 @@ export default function SettingsPage() {
     setError(null);
     setSaving(true);
     try {
-      if (data.excludedCustomers) {
-        const err = validateExcludedCustomers(data.excludedCustomers, "รถทั่วไป");
-        if (err) {
-          setError(err);
-          return;
-        }
-      }
-      if (data.departmentExcludedCustomers && data.branch.departments) {
-        for (const d of data.branch.departments) {
-          const err = validateExcludedCustomers(data.departmentExcludedCustomers[d.code] ?? [], d.label);
-          if (err) {
-            setError(err);
-            return;
-          }
-        }
+      const err = validateExcludedCustomers(data.excludedCustomers);
+      if (err) {
+        setError(err);
+        return;
       }
       const res = await fetch("/api/settings", {
         method: "POST",
@@ -145,9 +93,7 @@ export default function SettingsPage() {
         body: JSON.stringify({
           branchId,
           excludedCustomers: data.excludedCustomers,
-          qty: data.qty,
-          departmentExcludedCustomers: data.departmentExcludedCustomers,
-          departmentQty: data.departmentQty,
+          pumpFillSalesperson: data.pumpFillSalesperson,
           updatedBy: updatedBy || undefined,
         }),
       });
@@ -170,8 +116,10 @@ export default function SettingsPage() {
       <div className="mx-auto max-w-3xl space-y-6">
         <header className="flex items-center justify-between">
           <div>
-            <h1 className="text-2xl font-bold">ตั้งค่าเงื่อนไขการคำนวณ</h1>
-            <p className="mt-1 text-sm text-neutral-600">แก้ไขรายชื่อลูกค้าที่ยกเว้น และเกณฑ์ปริมาณ โดยไม่ต้องแก้โค้ด — มีผลทันทีกับการคำนวณครั้งถัดไปของทุกคน</p>
+            <h1 className="text-2xl font-bold">ตั้งค่าลูกค้าที่ยกเว้นจากค่าคอม</h1>
+            <p className="mt-1 text-sm text-neutral-600">
+              แก้ไขได้โดยไม่ต้องแก้โค้ด — มีผลทันทีกับการคำนวณครั้งถัดไปของทุกคน (เกณฑ์ปริมาณและค่าขนส่งใช้กฎเดียวกันทุกสาขาแล้ว ไม่มีให้ตั้งค่าต่อสาขาอีกต่อไป — ดูที่ src/lib/calc/channelRules.ts)
+            </p>
           </div>
           <Link href="/" className="whitespace-nowrap text-sm text-neutral-600 underline">
             ← กลับหน้าคำนวณ
@@ -195,142 +143,39 @@ export default function SettingsPage() {
         {data && !loading && (
           <>
             <div className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
-              <h2 className="font-semibold">เกณฑ์ปริมาณ</h2>
-              {data.qty && (
-                <div className="mt-3">
-                  {data.departmentQty && <p className="mb-1 text-xs font-medium text-neutral-500">รถทั่วไป (ไฟล์ที่ไม่ตรงกับแผนกด้านล่าง)</p>}
-                  <div className="grid grid-cols-3 gap-3 text-sm">
-                    <div>
-                      <label className="block text-xs text-neutral-500">ปริมาณขั้นต่ำ (ลิตร/บิล)</label>
-                      <input
-                        type="number"
-                        min={0}
-                        className="mt-1 w-full rounded border border-neutral-300 px-2 py-1"
-                        value={data.qty.minQtyLiters}
-                        onChange={(e) => updateFlatQty("minQtyLiters", Number(e.target.value))}
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-neutral-500">ต้องลงท้ายพันพอดี</label>
-                      <select
-                        className="mt-1 w-full rounded border border-neutral-300 px-2 py-1"
-                        value={data.qty.requireExactMultiple ? "yes" : "no"}
-                        onChange={(e) => updateFlatQty("requireExactMultiple", e.target.value === "yes")}
-                      >
-                        <option value="no">ไม่ต้อง</option>
-                        <option value="yes">ต้อง</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs text-neutral-500">หารลงตัวด้วย (ลิตร)</label>
-                      <input
-                        type="number"
-                        min={1}
-                        className="mt-1 w-full rounded border border-neutral-300 px-2 py-1"
-                        value={data.qty.qtyMultipleOf}
-                        onChange={(e) => updateFlatQty("qtyMultipleOf", Number(e.target.value))}
-                        disabled={!data.qty.requireExactMultiple}
-                      />
-                    </div>
-                  </div>
-                </div>
-              )}
-              {data.departmentQty && data.branch.departments && (
-                <>
-                  {data.qty && <p className="mb-1 mt-4 text-xs font-medium text-neutral-500">แยกตามแผนก</p>}
-                  <div className="mt-3 overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-left text-xs text-neutral-500">
-                          <th className="pb-1 pr-2">แผนก</th>
-                          <th className="pb-1 pr-2">ปริมาณขั้นต่ำ (ลิตร/บิล)</th>
-                          <th className="pb-1 pr-2">ต้องลงท้ายพันพอดี</th>
-                          <th className="pb-1 pr-2">หารลงตัวด้วย</th>
-                          <th className="pb-1">เซลล์คงที่ทั้งแผนก</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {data.branch.departments.map((d) => {
-                          const rule = data.departmentQty![d.code];
-                          return (
-                            <tr key={d.code} className="border-t border-neutral-100">
-                              <td className="py-1.5 pr-2 font-medium">
-                                {d.label} ({d.code})
-                              </td>
-                              <td className="py-1.5 pr-2">
-                                <input
-                                  type="number"
-                                  min={0}
-                                  className="w-28 rounded border border-neutral-300 px-2 py-1"
-                                  value={rule.minQtyLiters}
-                                  onChange={(e) => updateDeptQty(d.code, "minQtyLiters", Number(e.target.value))}
-                                />
-                              </td>
-                              <td className="py-1.5 pr-2">
-                                <select
-                                  className="rounded border border-neutral-300 px-2 py-1"
-                                  value={rule.requireExactMultiple ? "yes" : "no"}
-                                  onChange={(e) => updateDeptQty(d.code, "requireExactMultiple", e.target.value === "yes")}
-                                >
-                                  <option value="no">ไม่ต้อง</option>
-                                  <option value="yes">ต้อง</option>
-                                </select>
-                              </td>
-                              <td className="py-1.5 pr-2">
-                                <input
-                                  type="number"
-                                  min={1}
-                                  className="w-24 rounded border border-neutral-300 px-2 py-1"
-                                  value={rule.qtyMultipleOf}
-                                  onChange={(e) => updateDeptQty(d.code, "qtyMultipleOf", Number(e.target.value))}
-                                  disabled={!rule.requireExactMultiple}
-                                />
-                              </td>
-                              <td className="py-1.5">
-                                {rule.fixedSalesperson !== null && rule.fixedSalesperson !== undefined ? (
-                                  <input
-                                    placeholder="ชื่อเซลล์"
-                                    className="w-32 rounded border border-neutral-300 px-2 py-1"
-                                    value={rule.fixedSalesperson}
-                                    onChange={(e) => updateDeptQty(d.code, "fixedSalesperson", e.target.value)}
-                                  />
-                                ) : (
-                                  <span className="text-xs text-neutral-400">— (หาจากไฟล์ master)</span>
-                                )}
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </div>
-                </>
-              )}
+              <h2 className="font-semibold">เซลล์ประจำช่องทางกรอกหลังปั๊ม</h2>
+              <p className="mt-1 text-xs text-neutral-500">
+                ถ้ากรอกชื่อไว้ ลูกค้ากรอกหลังปั๊มทุกรายของสาขานี้จะถูกนับเป็นของเซลล์คนนี้ทั้งหมด ไม่ต้องยืนยันทีละราย — เว้นว่างไว้ถ้าช่องทางนี้ต้องแยกเซลล์ตามลูกค้า (เช่น วานรนิวาส)
+              </p>
+              <input
+                placeholder="เช่น อ้อม (เว้นว่าง = แยกตามลูกค้า)"
+                className="mt-2 w-full rounded border border-neutral-300 px-3 py-2 text-sm"
+                value={data.pumpFillSalesperson ?? ""}
+                onChange={(e) => setData({ ...data, pumpFillSalesperson: e.target.value || null })}
+              />
             </div>
 
-            {data.excludedCustomers && (
-              <div className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
-                <h2 className="font-semibold">ลูกค้าที่ยกเว้นจากค่าคอม : รถทั่วไป</h2>
-                <div className="mt-3">
-                  <ExcludedCustomerEditor rows={data.excludedCustomers} onChange={(rows) => setData({ ...data, excludedCustomers: rows })} />
-                </div>
+            <div className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
+              <div className="flex items-center justify-between">
+                <h2 className="font-semibold">ลูกค้าที่ยกเว้นจากค่าคอมการตลาด</h2>
+                <button onClick={addRow} className="rounded bg-neutral-100 px-3 py-1 text-xs font-medium hover:bg-neutral-200">
+                  + เพิ่มลูกค้า
+                </button>
               </div>
-            )}
-
-            {data.departmentExcludedCustomers &&
-              data.branch.departments?.map((d) => (
-                <div key={d.code} className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
-                  <h2 className="font-semibold">
-                    ลูกค้าที่ยกเว้นจากค่าคอม : ช่องทาง {d.label}
-                  </h2>
-                  <div className="mt-3">
-                    <ExcludedCustomerEditor
-                      rows={data.departmentExcludedCustomers![d.code] ?? []}
-                      onChange={(rows) => setData({ ...data, departmentExcludedCustomers: { ...data.departmentExcludedCustomers!, [d.code]: rows } })}
-                    />
+              <div className="mt-3 space-y-2">
+                {data.excludedCustomers.length === 0 && <p className="text-sm text-neutral-500">ไม่มีลูกค้าที่ยกเว้น</p>}
+                {data.excludedCustomers.map((c, idx) => (
+                  <div key={idx} className="grid grid-cols-[1fr_1.2fr_1.6fr_auto] items-start gap-2">
+                    <input placeholder="รหัสลูกค้า" className="rounded border border-neutral-300 px-2 py-1 text-sm" value={c.customerCode} onChange={(e) => updateRow(idx, "customerCode", e.target.value)} />
+                    <input placeholder="ชื่อลูกค้า" className="rounded border border-neutral-300 px-2 py-1 text-sm" value={c.customerName} onChange={(e) => updateRow(idx, "customerName", e.target.value)} />
+                    <input placeholder="เหตุผลที่ยกเว้น" className="rounded border border-neutral-300 px-2 py-1 text-sm" value={c.reason} onChange={(e) => updateRow(idx, "reason", e.target.value)} />
+                    <button onClick={() => removeRow(idx)} className="rounded px-2 py-1 text-xs text-red-700 hover:bg-red-50">
+                      ลบ
+                    </button>
                   </div>
-                </div>
-              ))}
+                ))}
+              </div>
+            </div>
 
             <div className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
               <label className="block text-sm font-medium">ชื่อผู้แก้ไข (ไม่บังคับ)</label>
