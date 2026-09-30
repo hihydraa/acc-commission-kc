@@ -2,11 +2,9 @@ import type { TeamSplitConfig } from "./teamSplit";
 import type { CommissionThresholds } from "./commissionEngine";
 
 /**
- * Universal rules shared by EVERY branch (confirmed with the user
- * 2026-09-18, superseding สามทอง/กระนวน's earlier divergent per-branch
- * numbers) — the marketing-commission-calc method never actually depended
- * on the branch, only on which of two CHANNELS a file belongs to. There are
- * exactly two:
+ * Universal rules shared by EVERY branch — the marketing-commission-calc
+ * method never actually depended on the branch, only on which of two
+ * CHANNELS a file belongs to. There are exactly two:
  *
  * - "deliveryRoute": รถมิเตอร์ (numbered delivery trucks), รถเทรลเลอร์
  *   (trailers), and any externally-contracted truck ("รถนอก", confirmed
@@ -16,11 +14,17 @@ import type { CommissionThresholds } from "./commissionEngine";
  *   now decided by which of the 3 upload inputs a file was dropped into,
  *   not by inferring it from a filename or an in-file "เลือกแผนก" header.
  * - "pumpFill": กรอกหลังปั๊ม — fixed ค่าขนส่ง/ลิตร, no distance needed, every
- *   liter counts (already กระนวน's B3 rule; now universal).
+ *   liter counts, no exact-multiple requirement (already กระนวน's B3 rule;
+ *   universal, unaffected by the 2026-09-30 change below).
  *
- * The qty rule below is กระนวน's (≥2,000 ลิตร, no exact-multiple-of-1,000
- * requirement) — the user's explicit choice overriding สามทอง's stricter
- * rule for BOTH existing branches going forward, not just new ones.
+ * requireExactMultiple on the delivery-route rule has flipped twice:
+ * 2026-09-18 the user chose กระนวน's looser rule (no exact-multiple-of-1,000
+ * requirement) for both existing branches going forward; 2026-09-30 the
+ * user reverted that specifically for deliveryRoute back to สามทอง's
+ * original stricter rule (a qualifying delivery-route sale that doesn't
+ * end in an exact multiple of 1,000 liters earns nothing), universal across
+ * every branch — pumpFill was explicitly confirmed to stay as-is, still
+ * counting every liter with no exact-multiple requirement.
  */
 export interface ChannelRule {
   minQtyLiters: number;
@@ -33,7 +37,7 @@ export interface ChannelRule {
 
 export const DELIVERY_ROUTE_RULE: ChannelRule = {
   minQtyLiters: 2000,
-  requireExactMultiple: false,
+  requireExactMultiple: true,
   qtyMultipleOf: 1000,
   fixedFreightRate: null,
 };
