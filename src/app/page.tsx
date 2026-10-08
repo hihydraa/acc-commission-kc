@@ -1,8 +1,60 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import Link from "next/link";
 import { BRANCHES } from "@/branches";
+
+const TH_MONTHS_ABBR = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+
+/** One calendar month, expressed in every label format this page's 3 period
+ *  fields use — derived from a single {monthIdx, buddhistYear} pair so
+ *  periodLabel/periodLabelThai/arAsOfLabel can never silently disagree with
+ *  each other the way 3 independent free-text boxes could (e.g. "8/69"
+ *  typed next to "ก.ย. 2569" — wrong month, easy typo, previously had no
+ *  guard at all). */
+interface MonthOption {
+  key: string; // "2026-7" (Gregorian year-month, 0-indexed month) — stable <option> value
+  /** "8/69" — matches periodLabel's existing format exactly */
+  periodLabel: string;
+  /** "ส.ค. 2569" — matches periodLabelThai's existing format exactly */
+  periodLabelThai: string;
+  /** "7 ก.ย.69" if THIS month is picked as the AR report's own month —
+   *  matches arAsOfLabel's existing format exactly. When the AR dropdown's
+   *  default is computed from the sales period instead, that's a separate
+   *  "pick next month's key" step (see periodKey's onChange below), not
+   *  baked into this field — this field is always just "the 7th, in this
+   *  same month", regardless of why a given MonthOption got selected. */
+  arAsOfLabelThisMonth: string;
+}
+
+function buildMonthOptions(): MonthOption[] {
+  const now = new Date();
+  const options: MonthOption[] = [];
+  // 24 months back covers a realistic backlog window; 2 months forward
+  // covers entering a period just before its files are ready.
+  for (let offset = 2; offset >= -24; offset--) {
+    const d = new Date(now.getFullYear(), now.getMonth() + offset, 1);
+    const buddhistYear = d.getFullYear() + 543;
+    const yy = String(buddhistYear).slice(-2);
+    options.push({
+      key: `${d.getFullYear()}-${d.getMonth()}`,
+      periodLabel: `${d.getMonth() + 1}/${yy}`,
+      periodLabelThai: `${TH_MONTHS_ABBR[d.getMonth()]} ${buddhistYear}`,
+      arAsOfLabelThisMonth: `7 ${TH_MONTHS_ABBR[d.getMonth()]}${yy}`,
+    });
+  }
+  return options;
+}
+
+/** The AR report is always dated the 7th of the month AFTER the sales
+ *  period, per the Incentive policy's own reporting cycle — used only to
+ *  pick a sensible DEFAULT when the period dropdown changes; the AR
+ *  dropdown stays independently editable afterward. */
+function nextMonthKey(key: string): string {
+  const [y, m] = key.split("-").map(Number);
+  const d = new Date(y, m + 1, 1);
+  return `${d.getFullYear()}-${d.getMonth()}`;
+}
 
 interface QualifyingCustomerPreview {
   customerCode: string;
@@ -98,9 +150,14 @@ export default function Home() {
   const [pumpFillFiles, setPumpFillFiles] = useState<File[]>([]);
   const [arFile, setArFile] = useState<File | null>(null);
 
-  const [periodLabel, setPeriodLabel] = useState("");
-  const [periodLabelThai, setPeriodLabelThai] = useState("");
-  const [arAsOfLabel, setArAsOfLabel] = useState("");
+  const monthOptions = useMemo(() => buildMonthOptions(), []);
+  const [periodKey, setPeriodKey] = useState(""); // drives periodLabel + periodLabelThai together
+  const [arAsOfKey, setArAsOfKey] = useState(""); // its own dropdown — defaults to periodKey's next month, but independently editable after that
+  const periodOption = monthOptions.find((o) => o.key === periodKey) ?? null;
+  const arAsOfOption = monthOptions.find((o) => o.key === arAsOfKey) ?? null;
+  const periodLabel = periodOption?.periodLabel ?? "";
+  const periodLabelThai = periodOption?.periodLabelThai ?? "";
+  const arAsOfLabel = arAsOfOption?.arAsOfLabelThisMonth ?? "";
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -300,15 +357,53 @@ export default function Home() {
             <div className="grid grid-cols-3 gap-3">
               <div>
                 <label className="block text-sm font-medium">งวด (เช่น 8/69)</label>
-                <input required className="mt-1 w-full rounded border border-neutral-300 px-2 py-2 text-sm" value={periodLabel} onChange={(e) => setPeriodLabel(e.target.value)} placeholder="8/69" />
+                <select
+                  required
+                  className="mt-1 w-full rounded border border-neutral-300 px-2 py-2 text-sm"
+                  value={periodKey}
+                  onChange={(e) => {
+                    const key = e.target.value;
+                    setPeriodKey(key);
+                    // Smart default, not a lock — the AR dropdown right next
+                    // to this one stays independently editable afterward.
+                    if (key) setArAsOfKey(nextMonthKey(key));
+                  }}
+                >
+                  <option value="" disabled>
+                    เลือกงวด
+                  </option>
+                  {monthOptions.map((o) => (
+                    <option key={o.key} value={o.key}>
+                      {o.periodLabel}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div>
                 <label className="block text-sm font-medium">งวด (ไทย)</label>
-                <input required className="mt-1 w-full rounded border border-neutral-300 px-2 py-2 text-sm" value={periodLabelThai} onChange={(e) => setPeriodLabelThai(e.target.value)} placeholder="ส.ค. 2569" />
+                <select required className="mt-1 w-full rounded border border-neutral-300 px-2 py-2 text-sm" value={periodKey} onChange={(e) => setPeriodKey(e.target.value)}>
+                  <option value="" disabled>
+                    เลือกงวด
+                  </option>
+                  {monthOptions.map((o) => (
+                    <option key={o.key} value={o.key}>
+                      {o.periodLabelThai}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div>
                 <label className="block text-sm font-medium">วันที่รายงานลูกหนี้</label>
-                <input required className="mt-1 w-full rounded border border-neutral-300 px-2 py-2 text-sm" value={arAsOfLabel} onChange={(e) => setArAsOfLabel(e.target.value)} placeholder="7 ก.ย.69" />
+                <select required className="mt-1 w-full rounded border border-neutral-300 px-2 py-2 text-sm" value={arAsOfKey} onChange={(e) => setArAsOfKey(e.target.value)}>
+                  <option value="" disabled>
+                    เลือกวันที่
+                  </option>
+                  {monthOptions.map((o) => (
+                    <option key={o.key} value={o.key}>
+                      {o.arAsOfLabelThisMonth}
+                    </option>
+                  ))}
+                </select>
               </div>
             </div>
 
