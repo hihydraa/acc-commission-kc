@@ -29,19 +29,27 @@ interface MonthOption {
 
 function buildMonthOptions(): MonthOption[] {
   const now = new Date();
+  const currentBuddhistYear = now.getFullYear() + 543;
   const options: MonthOption[] = [];
-  // 24 months back covers a realistic backlog window; 2 months forward
-  // covers entering a period just before its files are ready.
-  for (let offset = 2; offset >= -24; offset--) {
-    const d = new Date(now.getFullYear(), now.getMonth() + offset, 1);
-    const buddhistYear = d.getFullYear() + 543;
+  // The current Buddhist year plus the next one (e.g. 2569/70) — this
+  // branch only ever processes the current fiscal year's own periods, so a
+  // multi-year rolling-back window was just clutter. One extra trailing
+  // month (Jan of year+2) so the "วันที่รายงานลูกหนี้" dropdown's own
+  // auto-default (always the NEXT month after งวด, see nextMonthKey below)
+  // still resolves for a งวด of December in the later of the two years,
+  // instead of silently coming up empty right at the year boundary.
+  for (let buddhistYear = currentBuddhistYear; buddhistYear <= currentBuddhistYear + 2; buddhistYear++) {
+    const gYear = buddhistYear - 543;
     const yy = String(buddhistYear).slice(-2);
-    options.push({
-      key: `${d.getFullYear()}-${d.getMonth()}`,
-      periodLabel: `${d.getMonth() + 1}/${yy}`,
-      periodLabelThai: `${TH_MONTHS_ABBR[d.getMonth()]} ${buddhistYear}`,
-      arAsOfLabelThisMonth: `7 ${TH_MONTHS_ABBR[d.getMonth()]}${yy}`,
-    });
+    const lastMonth = buddhistYear === currentBuddhistYear + 2 ? 0 : 11; // only January for the trailing extra year
+    for (let month = 0; month <= lastMonth; month++) {
+      options.push({
+        key: `${gYear}-${month}`,
+        periodLabel: `${month + 1}/${yy}`,
+        periodLabelThai: `${TH_MONTHS_ABBR[month]} ${buddhistYear}`,
+        arAsOfLabelThisMonth: `7 ${TH_MONTHS_ABBR[month]}${yy}`,
+      });
+    }
   }
   return options;
 }
