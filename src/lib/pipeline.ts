@@ -223,6 +223,14 @@ export async function runCommissionPipeline(
   const exportRows: ExportTransactionRow[] = [];
   const truckLabels: string[] = [];
   const truckScopes = new Map<string, SheetScope>();
+  // One truck sheet is always exactly one channel (see truckLabelForChannel)
+  // — threaded through to excelExport so each sheet's Master VLOOKUP can
+  // match the composite customerCode|channel key instead of customerCode
+  // alone, which is what actually makes a channel-specific override (e.g.
+  // ทางผ่าน on เทรลเลอร์ but priced normally on รถมิเตอร์) resolve correctly
+  // once Excel recalculates the formula, instead of always landing on
+  // whichever row happens to be the FIRST customerCode match in Master.
+  const truckChannels = new Map<string, ChannelKey>();
   const rosterSet = new Set(roster);
   const fuelSet = new Set(branch.fuelProductCodes);
   const customerNameByCode = new Map<string, string>();
@@ -263,6 +271,7 @@ export async function runCommissionPipeline(
       if (!truckScopes.has(truckLabel)) {
         truckScopes.set(truckLabel, { minQtyLiters: rule.minQtyLiters, requireExactMultiple: rule.requireExactMultiple, qtyMultipleOf: rule.qtyMultipleOf, fixedFreightRate: rule.fixedFreightRate });
       }
+      if (!truckChannels.has(truckLabel)) truckChannels.set(truckLabel, group.channel);
       const scope = truckScopes.get(truckLabel)!;
 
       warnings.push(...parsed.warnings.map((w) => `[${truckLabel}] ${w}`));
@@ -448,35 +457,45 @@ export async function runCommissionPipeline(
   // each distinct variant as its own row, each already carrying its own
   // channel label in sourceText (see `master = { ...resolved, sourceText:
   // ... (${CHANNEL_LABEL_TH[...]}) }` above).
-  const entriesByCode = new Map<string, MasterEntry[]>();
+  const entriesByCode = new Map<string, { channel: ChannelKey; entry: MasterEntry }[]>();
   for (const [key, entry] of masterByCode) {
-    const code = key.slice(0, key.lastIndexOf("|"));
+    const sep = key.lastIndexOf("|");
+    const code = key.slice(0, sep);
+    const channel = key.slice(sep + 1) as ChannelKey;
     const list = entriesByCode.get(code) ?? [];
-    list.push(entry);
+    list.push({ channel, entry });
     entriesByCode.set(code, list);
   }
   const variantKey = (e: MasterEntry) => `${e.distanceKm}|${e.salesperson}|${e.tag}`;
-  const masterRowEntries: [string, MasterEntry][] = [];
-  for (const [code, entries] of entriesByCode) {
-    const distinct = [...new Map(entries.map((e) => [variantKey(e), e])).values()];
-    if (distinct.length === 1) {
-      // Only one variant across every channel — not actually
-      // channel-specific, so don't imply it is.
-      masterRowEntries.push([code, { ...distinct[0], sourceText: distinct[0].sourceText.replace(/\s*\([^()]*\)$/, "") }]);
+  // "" = this row applies to every channel — written into Excel's Master
+  // sheet with a blank channel suffix on its lookup key, so every truck
+  // sheet's formula falls back to it when no channel-specific row exists.
+  const masterRowEntries: [string, MasterEntry, ChannelKey | ""][] = [];
+  for (const [code, items] of entriesByCode) {
+    const distinctVariants = new Set(items.map((i) => variantKey(i.entry)));
+    if (distinctVariants.size === 1) {
+      // Every channel resolved to the identical entry — not actually
+      // channel-specific, so one shared row covering every channel.
+      const e = items[0].entry;
+      masterRowEntries.push([code, { ...e, sourceText: e.sourceText.replace(/\s*\([^()]*\)$/, "") }, ""]);
     } else {
-      for (const e of distinct) masterRowEntries.push([code, e]);
+      // Channels genuinely disagree — one row PER channel, each tagged with
+      // its own channel so Excel's lookup can tell them apart (see
+      // excelExport.ts's composite customerCode|channel key).
+      for (const { channel, entry } of items) masterRowEntries.push([code, entry, channel]);
     }
   }
-  for (const [code, entry] of excludedEntriesSeen) masterRowEntries.push([code, entry]);
+  for (const [code, entry] of excludedEntriesSeen) masterRowEntries.push([code, entry, ""]);
 
   const excludedCodes = new Set(excludedEntriesSeen.keys());
-  const masterRows: MasterSheetRow[] = masterRowEntries.map(([customerCode, e]) => ({
+  const masterRows: MasterSheetRow[] = masterRowEntries.map(([customerCode, e, channel]) => ({
     customerCode,
     customerName: excludedCodes.has(customerCode) ? e.customerName : customerNameByCode.get(customerCode) || e.customerName || customerCode,
     salesperson: e.salesperson,
     distanceKm: e.distanceKm,
     tag: e.tag,
     sourceText: e.sourceText,
+    channel,
   }));
 
   const workbook = await buildCommissionWorkbook({
@@ -485,6 +504,7 @@ export async function runCommissionPipeline(
     roster,
     truckLabels,
     truckScopes,
+    truckChannels,
     rows: exportRows,
     masterRows,
     debtQtyTotal: debtMatches.reduce((s, r) => s + (r.outstandingQty ?? 0), 0),

@@ -1,7 +1,34 @@
 import ExcelJS from "exceljs";
 import type { BranchConfig } from "@/branches/types";
 import type { TransactionCalcResult } from "./calc/commissionEngine";
+import type { ChannelKey } from "./pipeline";
 import { SHARED_THRESHOLDS, SHARED_RATE_PER_LITER, SHARED_PENALTY_NEGATIVE_Q_ENABLED, SHARED_TEAM_SPLIT, DELIVERY_ROUTE_RULE } from "./calc/channelRules";
+
+/** Master's hidden lookup-key column: customerCode & "|" & channel ("" for a
+ *  row that applies to every channel). A customer can now have more than
+ *  one Master row sharing the same customerCode (one per channel that
+ *  resolves differently — see pipeline.ts's masterRowEntries), so a plain
+ *  VLOOKUP/MATCH on customerCode alone would always land on whichever row
+ *  happens to come first, regardless of which truck sheet is asking. Every
+ *  per-truck formula below matches this composite key for ITS OWN channel
+ *  first, falling back to the blank-channel ("code|") general row. */
+function masterLookupKey(customerCode: string, channel: ChannelKey | ""): string {
+  return `${customerCode}|${channel}`;
+}
+
+/** Two-tier INDEX/MATCH against Master's hidden column G (see
+ *  masterLookupKey): tries THIS sheet's own channel-specific row first,
+ *  falling back to the blank-channel general row — the Excel-formula
+ *  equivalent of MasterLookup.get's `byChannel.get(channel) ?? byChannel.get("")`
+ *  (pipeline.ts). Replaces the old single-tier `VLOOKUP(D{row},Master!$A:$D,...)`,
+ *  which only ever matched the FIRST row with that customerCode — wrong as
+ *  soon as a customer has more than one Master row (one per channel). */
+function masterLookupFormula(excelRow: number, channel: ChannelKey, masterCol: "B" | "C" | "D", fallbackLiteral: string): string {
+  return (
+    `IFERROR(INDEX(Master!$${masterCol}:$${masterCol},MATCH(D${excelRow}&"|"&"${channel}",Master!$G:$G,0)),` +
+    `IFERROR(INDEX(Master!$${masterCol}:$${masterCol},MATCH(D${excelRow}&"|",Master!$G:$G,0)),${fallbackLiteral}))`
+  );
+}
 
 /** Supplied per calculation run (periods change monthly — no longer baked
  *  into BranchConfig, see branches/types.ts). */
@@ -70,6 +97,9 @@ export interface MasterSheetRow {
   distanceKm: number | null;
   tag: "1สาย1สู้" | "ทางผ่าน" | "";
   sourceText: string;
+  /** "" = this row applies to every channel. A specific channel means this
+   *  row is a channel-specific override — see masterLookupKey's comment. */
+  channel: ChannelKey | "";
 }
 
 /** Per-sheet qty threshold + freight rule — one truck/department sheet is
@@ -90,6 +120,9 @@ export interface BuildWorkbookInput {
   roster: string[];
   truckLabels: string[];
   truckScopes: Map<string, SheetScope>;
+  /** every truck sheet is exactly one channel — see masterLookupKey's
+   *  comment for why the Master VLOOKUP formulas need this. */
+  truckChannels: Map<string, ChannelKey>;
   rows: ExportTransactionRow[];
   masterRows: MasterSheetRow[];
   debtQtyTotal: number;
@@ -301,7 +334,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
   const usedSheetNames = new Set<string>();
 
   // ---------- Master ----------
-  const MASTER_HEADER = ["รหัสลูกค้า", "เซลล์", "ระยะทาง(กม.)", "Tag", "ชื่อลูกค้า", "ที่มา"];
+  const MASTER_HEADER = ["รหัสลูกค้า", "เซลล์", "ระยะทาง(กม.)", "Tag", "ชื่อลูกค้า", "ที่มา", "คีย์ช่องทาง"];
   const masterSheet = workbook.addWorksheet(safeSheetName("Master", usedSheetNames));
   masterSheet.addRow(MASTER_HEADER);
   styleHeaderRow(masterSheet.getRow(1), MASTER_HEADER.length);
@@ -313,12 +346,15 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     // list here.
     const isExcluded = m.salesperson.startsWith("ตัดออก");
     const isUserConfirmed = m.sourceText.startsWith("ยืนยันจากผู้ใช้");
-    const row = masterSheet.addRow([m.customerCode, m.salesperson, m.distanceKm, m.tag, m.customerName, m.sourceText]);
+    const row = masterSheet.addRow([m.customerCode, m.salesperson, m.distanceKm, m.tag, m.customerName, m.sourceText, masterLookupKey(m.customerCode, m.channel)]);
     styleDataRowBorders(row, MASTER_HEADER.length);
     if (isExcluded) row.eachCell((c) => (c.fill = EXCLUDE_FILL));
     else if (isUserConfirmed) row.eachCell((c) => (c.fill = HIGHLIGHT_FILL));
   }
-  [14, 26, 12, 12, 32, 50].forEach((w, i) => (masterSheet.getColumn(i + 1).width = w));
+  [14, 26, 12, 12, 32, 50, 0].forEach((w, i) => (masterSheet.getColumn(i + 1).width = w));
+  // Hidden helper column — not meant for human eyes, just so every truck
+  // sheet's formula can do a channel-aware lookup (see masterLookupKey).
+  masterSheet.getColumn(7).hidden = true;
 
   // ---------- per-truck sheets ----------
   const TRUCK_HEADER = [
@@ -337,6 +373,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
     styleHeaderRow(sheet.getRow(1), TRUCK_HEADER.length);
 
     const scope = input.truckScopes.get(truckLabel) ?? DELIVERY_ROUTE_RULE;
+    const channel = input.truckChannels.get(truckLabel) ?? "meterTruck";
 
     const deptRows = input.rows.filter((r) => r.truckLabel === truckLabel);
     deptRows.forEach((r, idx) => {
@@ -358,8 +395,8 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
         r.customerCode,
         r.customerName,
         productLabel(r.productCode),
-        fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,3,FALSE()),"")`, gVal),
-        fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,4,FALSE()),"")`, hVal),
+        fv(masterLookupFormula(excelRow, channel, "C", '""'), gVal),
+        fv(masterLookupFormula(excelRow, channel, "D", '""'), hVal),
         r.qty,
         r.saleValue,
         r.cost,
@@ -370,7 +407,7 @@ export async function buildCommissionWorkbook(input: BuildWorkbookInput): Promis
         fv(`IFERROR(J${excelRow}-O${excelRow},"")`, r.calc.profitAfterFreight ?? ""),
         fv(`IFERROR(P${excelRow}/I${excelRow},"")`, r.calc.profitPerLiter ?? ""),
         fv(`IF(LEFT(C${excelRow},1)="H","ขายสด",IF(LEFT(C${excelRow},1)="I","ขายเชื่อ","ตรวจสอบ"))`, saleTypeLabel(r.saleType)),
-        fv(`IFERROR(VLOOKUP(D${excelRow},Master!$A:$D,2,FALSE()),"ตรวจสอบเซลล์")`, sVal),
+        fv(masterLookupFormula(excelRow, channel, "B", '"ตรวจสอบเซลล์"'), sVal),
         fv(commissionFormula(excelRow, input.roster, scope), r.calc.commission),
         noteParts.join("; "),
       ]);
