@@ -78,6 +78,50 @@ interface QualifyingCustomerPreview {
   resolvedByChannel: Partial<Record<ChannelKey, ResolvedMasterEntry | null>>;
 }
 
+function resolvedEntriesEqual(a: ResolvedMasterEntry | null, b: ResolvedMasterEntry | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.distanceKm === b.distanceKm && a.tag === b.tag && a.salesperson === b.salesperson;
+}
+
+/** Builds the confirm-page row(s) for one qualifying customer. Collapsing a
+ *  multi-channel customer into a single shared row is only safe when every
+ *  channel actually resolves to the SAME Sheet entry — confirmedCustomers
+ *  (handleFinalize) has no other way to carry a per-channel distinction
+ *  once submitted, so a customer whose channels resolve DIFFERENTLY (e.g.
+ *  charged by distance on รถมิเตอร์ but ทางผ่าน on เทรลเลอร์) must be
+ *  auto-split here — otherwise the single row's value (arbitrarily the
+ *  first channel's) would silently get applied to every channel at
+ *  calculation time, including ones the Sheet says should differ. */
+function buildRowsForCustomer(c: QualifyingCustomerPreview): ConfirmRow[] {
+  const firstResolved = c.resolvedByChannel[c.channels[0]] ?? null;
+  const allSame = c.channels.every((ch) => resolvedEntriesEqual(c.resolvedByChannel[ch] ?? null, firstResolved));
+  const channelsToEmit: (ChannelKey | "")[] = c.channels.length <= 1 || allSame ? [""] : c.channels;
+  return channelsToEmit.map((channel) => {
+    const resolved = (channel ? c.resolvedByChannel[channel] : firstResolved) ?? null;
+    const name = resolved?.customerName || c.customerName;
+    const distance = resolved?.distanceKm != null ? String(resolved.distanceKm) : "";
+    const tag = resolved?.tag ?? "";
+    const salesperson = resolved?.salesperson ?? "";
+    return {
+      customerCode: c.customerCode,
+      customerName: name,
+      truckLabels: (channel ? c.truckLabelsByChannel[channel] : null) ?? c.truckLabels,
+      channel,
+      distanceKm: distance,
+      tag,
+      salesperson,
+      fromSheet: resolved !== null,
+      originalCustomerName: name,
+      originalDistanceKm: distance,
+      originalTag: tag,
+      originalSalesperson: salesperson,
+      allChannels: c.channels,
+      resolvedByChannel: c.resolvedByChannel,
+      truckLabelsByChannel: c.truckLabelsByChannel,
+    };
+  });
+}
+
 interface ConfirmRow {
   customerCode: string;
   customerName: string;
@@ -231,38 +275,7 @@ export default function Home() {
       }
       setRoster(data.roster as string[]);
       setResolveWarnings(data.warnings as string[]);
-      setRows(
-        (data.customers as QualifyingCustomerPreview[]).map((c) => {
-          // Default/unsplit row: every channel resolves to the identical
-          // entry unless a Sheet override already exists (see
-          // resolvedByChannel's doc comment, pipeline.ts) — using the FIRST
-          // channel's value here is safe for that common case, and still a
-          // reasonable starting point to edit even when it isn't (the user
-          // can "แยกตามช่องทาง" to see/fix each channel's own value).
-          const resolved = c.resolvedByChannel[c.channels[0]] ?? null;
-          const name = resolved?.customerName || c.customerName;
-          const distance = resolved?.distanceKm != null ? String(resolved.distanceKm) : "";
-          const tag = resolved?.tag ?? "";
-          const salesperson = resolved?.salesperson ?? "";
-          return {
-            customerCode: c.customerCode,
-            customerName: name,
-            truckLabels: c.truckLabels,
-            channel: "" as const,
-            distanceKm: distance,
-            tag,
-            salesperson,
-            fromSheet: resolved !== null,
-            originalCustomerName: name,
-            originalDistanceKm: distance,
-            originalTag: tag,
-            originalSalesperson: salesperson,
-            allChannels: c.channels,
-            resolvedByChannel: c.resolvedByChannel,
-            truckLabelsByChannel: c.truckLabelsByChannel,
-          };
-        })
-      );
+      setRows((data.customers as QualifyingCustomerPreview[]).flatMap(buildRowsForCustomer));
       setStep("confirm");
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
