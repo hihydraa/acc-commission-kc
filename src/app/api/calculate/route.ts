@@ -21,6 +21,12 @@ const CHANNEL_FIELD: Record<ChannelKey, string> = {
 
 interface ConfirmedCustomer extends ResolvedMasterEntry {
   customerCode: string;
+  /** "" = this row applies to every channel (the common, unsplit case). A
+   *  specific channel means the user used the confirm page's "แยกตามช่องทาง"
+   *  option — this row is only THIS channel's override; the customer may
+   *  have a sibling ConfirmedCustomer entry (same code, different channel or
+   *  "") covering the rest. See MasterLookup's doc comment (pipeline.ts). */
+  channel: ChannelKey | "";
   /** true when the user actually typed/changed something on the confirm
    *  page (vs. it arriving already correct from the Sheet) — only these get
    *  written back, so an unedited row's Sheet data is never rewritten
@@ -66,8 +72,23 @@ export async function POST(request: NextRequest) {
     const roster = JSON.parse(rosterRaw) as string[];
     const confirmed = JSON.parse(confirmedRaw) as ConfirmedCustomer[];
 
-    const confirmedByCode = new Map(confirmed.map((c) => [c.customerCode, c]));
-    const masterLookup: MasterLookup = { get: (code) => confirmedByCode.get(code) ?? null };
+    // Keyed by code -> channel ("" = general), mirroring
+    // buildSheetMasterLookup's own shape — a channel-specific confirm-page
+    // row must never shadow a DIFFERENT channel's own (possibly still
+    // general) row for the same customer.
+    const confirmedByCode = new Map<string, Map<ChannelKey | "", ConfirmedCustomer>>();
+    for (const c of confirmed) {
+      const byChannel = confirmedByCode.get(c.customerCode) ?? new Map<ChannelKey | "", ConfirmedCustomer>();
+      byChannel.set(c.channel, c);
+      confirmedByCode.set(c.customerCode, byChannel);
+    }
+    const masterLookup: MasterLookup = {
+      get: (code, channel) => {
+        const byChannel = confirmedByCode.get(code);
+        if (!byChannel) return null;
+        return byChannel.get(channel) ?? byChannel.get("") ?? null;
+      },
+    };
 
     const result = await runCommissionPipeline(branch, channelInputs, arFile, period, roster, masterLookup);
 
@@ -94,6 +115,7 @@ export async function POST(request: NextRequest) {
           distanceKm: c.distanceKm,
           tag: c.tag,
           salesperson: c.salesperson,
+          channel: c.channel,
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

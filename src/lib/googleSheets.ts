@@ -1,5 +1,10 @@
 import { JWT } from "google-auth-library";
-import type { MasterLookup, ResolvedMasterEntry } from "./pipeline";
+import type { MasterLookup, ResolvedMasterEntry, ChannelKey } from "./pipeline";
+import { CHANNEL_LABEL_TH } from "./pipeline";
+
+const CHANNEL_BY_LABEL_TH: Partial<Record<string, ChannelKey>> = Object.fromEntries(
+  (Object.entries(CHANNEL_LABEL_TH) as [ChannelKey, string][]).map(([k, v]) => [v, k])
+);
 
 /**
  * Reads/writes the "Commission_Distance_Seller" Google Sheet — one tab per
@@ -27,6 +32,14 @@ export interface SheetRow {
   distanceKm: number | null;
   tag: "1สาย1สู้" | "ทางผ่าน" | "";
   salesperson: string;
+  /** "" = applies to every channel (the common case — nearly every customer
+   *  has exactly one row with this blank). A specific channel means this
+   *  row OVERRIDES the blank-channel row for that one channel only — e.g. a
+   *  customer that's "ทางผ่าน" specifically when a เทรลเลอร์ delivers, but
+   *  charged normally by distance otherwise, gets a blank-channel row PLUS
+   *  one channel="trailer" row. See MasterLookup's doc comment (pipeline.ts)
+   *  for why this exists. */
+  channel: ChannelKey | "";
 }
 
 function isConfigured(): boolean {
@@ -86,6 +99,7 @@ export async function readBranchSheet(tabName: string): Promise<SheetRow[]> {
   const idxDistance = col("ระยะทาง/กม.");
   const idxTag = col("หมายเหตุ");
   const idxSalesperson = col("เซลล์");
+  const idxChannel = col("ช่องทาง");
 
   const rows: SheetRow[] = [];
   for (let i = 1; i < values.length; i++) {
@@ -98,6 +112,7 @@ export async function readBranchSheet(tabName: string): Promise<SheetRow[]> {
     // column as text instead of a number (confirmed real: KN row 21,
     // "ปั๊มปุ๊บริการ ... ทางผ่าน"), so that text doubles as the tag there.
     const inlineTag = rawDistance === "ทางผ่าน" || rawDistance === "1สาย1สู้" ? (rawDistance as "1สาย1สู้" | "ทางผ่าน") : "";
+    const rawChannel = idxChannel >= 0 ? (row[idxChannel] ?? "").trim() : "";
     rows.push({
       rowNumber: i + 1,
       customerCode,
@@ -106,6 +121,11 @@ export async function readBranchSheet(tabName: string): Promise<SheetRow[]> {
       distanceKm: inlineTag ? null : parseDistance(rawDistance),
       tag: idxTag >= 0 ? parseTag(row[idxTag]) : inlineTag,
       salesperson: idxSalesperson >= 0 ? (row[idxSalesperson] ?? "").trim() : "",
+      // Unrecognized text in this column (a typo, or a header-mismatch on a
+      // tab without one yet) falls back to "" (applies to every channel)
+      // rather than erroring — same fail-soft convention as every other
+      // column here.
+      channel: CHANNEL_BY_LABEL_TH[rawChannel] ?? "",
     });
   }
   return rows;
@@ -139,7 +159,7 @@ function columnLetter(index: number): string {
  * column off from where it actually belongs. Any column this code doesn't
  * know about (ลำดับ, สินค้า) is preserved as-is on an update, or left blank
  * on a brand-new append, rather than being overwritten with the wrong value. */
-const CANONICAL_HEADER = ["ลำดับ", "ชื่อลูกค้า", "รหัส", "พื้นที่", "ระยะทาง/กม.", "เซลล์", "หมายเหตุ"];
+const CANONICAL_HEADER = ["ลำดับ", "ชื่อลูกค้า", "รหัส", "พื้นที่", "ระยะทาง/กม.", "เซลล์", "หมายเหตุ", "ช่องทาง"];
 
 export async function upsertRow(tabName: string, row: Omit<SheetRow, "rowNumber">): Promise<void> {
   let values = await fetchRange(tabName, "A1:Z1000");
@@ -166,12 +186,21 @@ export async function upsertRow(tabName: string, row: Omit<SheetRow, "rowNumber"
   const idxDistance = col("ระยะทาง/กม.");
   const idxTag = col("หมายเหตุ");
   const idxSalesperson = col("เซลล์");
+  const idxChannel = col("ช่องทาง");
   if (idxCode < 0) throw new Error(`Sheet tab '${tabName}' ไม่มีคอลัมน์ 'รหัส' — ไม่รู้จะเขียนลงคอลัมน์ไหน`);
 
   let rowNumber: number | null = null;
   let rowValues: string[] = new Array(header.length).fill("");
   for (let i = 1; i < values.length; i++) {
-    if ((values[i][idxCode] ?? "").trim() === row.customerCode) {
+    // Matched by (code, channel) when the tab has a ช่องทาง column — a
+    // customer can now legitimately have more than one row (a blank-channel
+    // general row plus a channel-specific override), so matching by code
+    // alone would silently overwrite the WRONG row. A tab that doesn't have
+    // this column yet has nowhere to persist the distinction anyway, so it
+    // falls back to matching by code only (the one row every such tab has).
+    const codeMatches = (values[i][idxCode] ?? "").trim() === row.customerCode;
+    const channelMatches = idxChannel < 0 || (values[i][idxChannel] ?? "").trim() === (row.channel ? CHANNEL_LABEL_TH[row.channel] : "");
+    if (codeMatches && channelMatches) {
       rowNumber = i + 1;
       rowValues = [...values[i]];
       while (rowValues.length < header.length) rowValues.push("");
@@ -194,6 +223,7 @@ export async function upsertRow(tabName: string, row: Omit<SheetRow, "rowNumber"
     rowValues[idxDistance] = row.tag ? row.tag : row.distanceKm != null ? String(row.distanceKm) : "";
   }
   if (idxSalesperson >= 0) rowValues[idxSalesperson] = row.salesperson;
+  if (idxChannel >= 0) rowValues[idxChannel] = row.channel ? CHANNEL_LABEL_TH[row.channel] : "";
   // ลำดับ (col A on both known tabs) is a cosmetic sequence number, not part
   // of our data model — auto-number a brand-new row so it isn't left blank;
   // an existing row's ลำดับ is preserved untouched via the rowValues copy above.
@@ -219,9 +249,21 @@ export async function buildSheetMasterLookup(tabName: string): Promise<MasterLoo
     return { get: () => null };
   }
   const rows = await readBranchSheet(tabName);
-  const byCode = new Map<string, ResolvedMasterEntry>();
+  // Keyed by code -> channel ("" = general) -> entry, so a channel-specific
+  // override row can coexist with a customer's general row without one
+  // silently clobbering the other (see SheetRow.channel's doc comment).
+  const byCode = new Map<string, Map<ChannelKey | "", ResolvedMasterEntry>>();
   for (const r of rows) {
-    byCode.set(r.customerCode, { customerName: r.customerName, distanceKm: r.distanceKm, salesperson: r.salesperson, tag: r.tag });
+    const entry: ResolvedMasterEntry = { customerName: r.customerName, distanceKm: r.distanceKm, salesperson: r.salesperson, tag: r.tag };
+    const byChannel = byCode.get(r.customerCode) ?? new Map<ChannelKey | "", ResolvedMasterEntry>();
+    byChannel.set(r.channel, entry);
+    byCode.set(r.customerCode, byChannel);
   }
-  return { get: (code: string) => byCode.get(code) ?? null };
+  return {
+    get: (code: string, channel: ChannelKey) => {
+      const byChannel = byCode.get(code);
+      if (!byChannel) return null;
+      return byChannel.get(channel) ?? byChannel.get("") ?? null;
+    },
+  };
 }

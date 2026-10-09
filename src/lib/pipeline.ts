@@ -39,9 +39,19 @@ const CHANNEL_RULE: Record<ChannelKey, ChannelRule> = {
  * until then, callers pass a stub that always returns null (see
  * `NullMasterLookup` below) so every qualifying customer is surfaced on the
  * confirmation page for manual entry — never silently guessed.
+ *
+ * Takes the CHANNEL a transaction came through — confirmed real (2026-10):
+ * a customer can need a genuinely different ค่าขนส่ง treatment depending on
+ * which vehicle delivers (e.g. รถมิเตอร์ charges by distance, but the SAME
+ * customer is "ทางผ่าน" — zero freight — when a เทรลเลอร์ happens to deliver
+ * instead). The Sheet can hold a channel-specific override row for a
+ * customer code (ช่องทาง column) alongside its general one; an
+ * implementation falls back to the general row when no override exists for
+ * the requested channel, so a customer with no override behaves exactly as
+ * before regardless of which channel asks.
  */
 export interface MasterLookup {
-  get(customerCode: string): ResolvedMasterEntry | null;
+  get(customerCode: string, channel: ChannelKey): ResolvedMasterEntry | null;
 }
 
 export interface ResolvedMasterEntry {
@@ -52,6 +62,15 @@ export interface ResolvedMasterEntry {
 }
 
 export const NULL_MASTER_LOOKUP: MasterLookup = { get: () => null };
+
+/** Thai labels for the Sheet's own "ช่องทาง" column (and the confirm page's
+ *  split-row UI) — matches the wording already used elsewhere for these 3
+ *  channels (upload slot labels, truckLabelForChannel). */
+export const CHANNEL_LABEL_TH: Record<ChannelKey, string> = {
+  meterTruck: "รถมิเตอร์",
+  trailer: "เทรลเลอร์",
+  pumpFill: "กรอกหลังปั๊ม",
+};
 
 /** "55.pdf" -> "รถ 55", "70.pdf" -> "เทรลเลอร์ 70" — the label prefix now
  *  comes from which channel slot the file was dropped into, not from
@@ -98,9 +117,17 @@ export interface QualifyingCustomerPreview {
   customerCode: string;
   customerName: string;
   truckLabels: string[];
-  /** null when this customer code has no row in the master lookup at all —
-   *  the confirmation page must collect one before /api/calculate can run */
-  resolved: ResolvedMasterEntry | null;
+  /** distinct channels this customer qualifies in, in first-seen order —
+   *  length > 1 is what the confirm page's "แยกตามช่องทาง" (split by
+   *  channel) option checks for; most customers only ever have one. */
+  channels: ChannelKey[];
+  truckLabelsByChannel: Partial<Record<ChannelKey, string[]>>;
+  /** resolved master data AS IF this customer were delivered via that
+   *  channel (a channel with no Sheet override falls back to the general
+   *  row, so every channel in `channels` always has an entry here even
+   *  before anyone has split anything) — null only when the customer has
+   *  NO row in the master lookup at all, general or channel-specific. */
+  resolvedByChannel: Partial<Record<ChannelKey, ResolvedMasterEntry | null>>;
 }
 
 /**
@@ -147,14 +174,22 @@ export async function previewQualifyingCustomers(
         const existing = seen.get(line.customerCode);
         if (existing) {
           if (!existing.truckLabels.includes(truckLabel)) existing.truckLabels.push(truckLabel);
+          const forChannel = existing.truckLabelsByChannel[group.channel] ?? (existing.truckLabelsByChannel[group.channel] = []);
+          if (!forChannel.includes(truckLabel)) forChannel.push(truckLabel);
+          if (!existing.channels.includes(group.channel)) {
+            existing.channels.push(group.channel);
+            existing.resolvedByChannel[group.channel] = masterLookup.get(line.customerCode, group.channel);
+          }
           continue;
         }
-        const resolved = masterLookup.get(line.customerCode);
+        const resolved = masterLookup.get(line.customerCode, group.channel);
         seen.set(line.customerCode, {
           customerCode: line.customerCode,
           customerName: resolved?.customerName || line.customerNameRaw || line.customerCode,
           truckLabels: [truckLabel],
-          resolved,
+          channels: [group.channel],
+          truckLabelsByChannel: { [group.channel]: [truckLabel] },
+          resolvedByChannel: { [group.channel]: resolved },
         });
       }
     }
@@ -266,11 +301,18 @@ export async function runCommissionPipeline(
         const docPrefix = line.docNo.charAt(0).toUpperCase();
         const saleType = (SHARED_DOC_PREFIX_TO_SALE_TYPE[docPrefix] ?? "unknown") as SaleType | "unknown";
 
-        let master = masterByCode.get(line.customerCode);
+        // Keyed by (code, channel), not just code — a customer can have a
+        // genuinely different resolved entry per channel now (see
+        // MasterLookup's doc comment: รถมิเตอร์ charges by distance but the
+        // SAME customer is "ทางผ่าน" when a เทรลเลอร์ delivers instead), so
+        // caching by code alone would leak whichever channel resolved it
+        // FIRST onto every other channel sharing that code.
+        const masterCacheKey = `${line.customerCode}|${group.channel}`;
+        let master = masterByCode.get(masterCacheKey);
         if (!master) {
-          const resolved = masterLookup.get(line.customerCode);
+          const resolved = masterLookup.get(line.customerCode, group.channel);
           if (resolved) {
-            master = { ...resolved, sourceText: `Google Sheet แท็บ '${branch.sheetTabName}'` };
+            master = { ...resolved, sourceText: `Google Sheet แท็บ '${branch.sheetTabName}' (${CHANNEL_LABEL_TH[group.channel]})` };
           } else if (group.channel === "pumpFill" && branch.pumpFillSalesperson) {
             // See branches/types.ts's pumpFillSalesperson doc comment —
             // these customers never appear in master data at all, the whole
@@ -283,7 +325,7 @@ export async function runCommissionPipeline(
               sourceText: `เซลล์ประจำกรอกหลังปั๊ม "${branch.pumpFillSalesperson}" (ตั้งค่าไว้ที่หน้า Settings) — ไม่มีในข้อมูล master`,
             };
           }
-          if (master) masterByCode.set(line.customerCode, master);
+          if (master) masterByCode.set(masterCacheKey, master);
         }
 
         const exclusion = branch.excludedCustomers.find((e) => e.customerCode === line.customerCode) ?? null;
@@ -397,9 +439,38 @@ export async function runCommissionPipeline(
     }
   }
 
-  const combinedMasterEntries = new Map<string, MasterEntry>([...masterByCode, ...excludedEntriesSeen]);
+  // masterByCode is keyed by "code|channel" (see masterCacheKey above), not
+  // plain code — unpack it back into one or more rows PER customer code. A
+  // customer whose every channel resolved to the identical entry (the
+  // common case — no channel-specific override exists) collapses to one
+  // row with a plain source note; one that genuinely differs by channel
+  // (the รถมิเตอร์-vs-เทรลเลอร์ "ทางผ่าน" case this was all built for) shows
+  // each distinct variant as its own row, each already carrying its own
+  // channel label in sourceText (see `master = { ...resolved, sourceText:
+  // ... (${CHANNEL_LABEL_TH[...]}) }` above).
+  const entriesByCode = new Map<string, MasterEntry[]>();
+  for (const [key, entry] of masterByCode) {
+    const code = key.slice(0, key.lastIndexOf("|"));
+    const list = entriesByCode.get(code) ?? [];
+    list.push(entry);
+    entriesByCode.set(code, list);
+  }
+  const variantKey = (e: MasterEntry) => `${e.distanceKm}|${e.salesperson}|${e.tag}`;
+  const masterRowEntries: [string, MasterEntry][] = [];
+  for (const [code, entries] of entriesByCode) {
+    const distinct = [...new Map(entries.map((e) => [variantKey(e), e])).values()];
+    if (distinct.length === 1) {
+      // Only one variant across every channel — not actually
+      // channel-specific, so don't imply it is.
+      masterRowEntries.push([code, { ...distinct[0], sourceText: distinct[0].sourceText.replace(/\s*\([^()]*\)$/, "") }]);
+    } else {
+      for (const e of distinct) masterRowEntries.push([code, e]);
+    }
+  }
+  for (const [code, entry] of excludedEntriesSeen) masterRowEntries.push([code, entry]);
+
   const excludedCodes = new Set(excludedEntriesSeen.keys());
-  const masterRows: MasterSheetRow[] = [...combinedMasterEntries.entries()].map(([customerCode, e]) => ({
+  const masterRows: MasterSheetRow[] = masterRowEntries.map(([customerCode, e]) => ({
     customerCode,
     customerName: excludedCodes.has(customerCode) ? e.customerName : customerNameByCode.get(customerCode) || e.customerName || customerCode,
     salesperson: e.salesperson,

@@ -64,21 +64,33 @@ function nextMonthKey(key: string): string {
   return `${d.getFullYear()}-${d.getMonth()}`;
 }
 
+type ChannelKey = "meterTruck" | "trailer" | "pumpFill";
+const CHANNEL_LABEL_TH: Record<ChannelKey, string> = { meterTruck: "รถมิเตอร์", trailer: "เทรลเลอร์", pumpFill: "กรอกหลังปั๊ม" };
+
+type ResolvedMasterEntry = { customerName: string; distanceKm: number | null; salesperson: string; tag: "1สาย1สู้" | "ทางผ่าน" | "" };
+
 interface QualifyingCustomerPreview {
   customerCode: string;
   customerName: string;
   truckLabels: string[];
-  resolved: { customerName: string; distanceKm: number | null; salesperson: string; tag: "1สาย1สู้" | "ทางผ่าน" | "" } | null;
+  channels: ChannelKey[];
+  truckLabelsByChannel: Partial<Record<ChannelKey, string[]>>;
+  resolvedByChannel: Partial<Record<ChannelKey, ResolvedMasterEntry | null>>;
 }
 
 interface ConfirmRow {
   customerCode: string;
   customerName: string;
   truckLabels: string[];
+  /** "" = this row covers every channel (the common, unsplit case — most
+   *  customers). A specific channel means "แยกตามช่องทาง" was used — this
+   *  row is only that channel's override; its siblings (same customerCode,
+   *  other channels) are separate rows elsewhere in `rows`. */
+  channel: ChannelKey | "";
   distanceKm: string; // kept as string for the input box; "" = blank
   tag: "1สาย1สู้" | "ทางผ่าน" | "";
   salesperson: string;
-  fromSheet: boolean; // true if the Sheet already had this customer
+  fromSheet: boolean; // true if the Sheet already had this customer/channel
   // Snapshot of what the Sheet actually had (or "" for a brand-new
   // customer) — compared against the live fields above at submit time to
   // decide whether this row needs writing back, so an unedited prefilled
@@ -88,6 +100,12 @@ interface ConfirmRow {
   originalDistanceKm: string;
   originalTag: "1สาย1สู้" | "ทางผ่าน" | "";
   originalSalesperson: string;
+  // Carried along from the /api/resolve preview purely so the "แยกตาม
+  // ช่องทาง" button can expand this one row into N — not sent to the
+  // server (see handleFinalize's confirmedCustomers mapping).
+  allChannels: ChannelKey[];
+  resolvedByChannel: Partial<Record<ChannelKey, ResolvedMasterEntry | null>>;
+  truckLabelsByChannel: Partial<Record<ChannelKey, string[]>>;
 }
 
 interface CalcSummary {
@@ -215,22 +233,33 @@ export default function Home() {
       setResolveWarnings(data.warnings as string[]);
       setRows(
         (data.customers as QualifyingCustomerPreview[]).map((c) => {
-          const name = c.resolved?.customerName || c.customerName;
-          const distance = c.resolved?.distanceKm != null ? String(c.resolved.distanceKm) : "";
-          const tag = c.resolved?.tag ?? "";
-          const salesperson = c.resolved?.salesperson ?? "";
+          // Default/unsplit row: every channel resolves to the identical
+          // entry unless a Sheet override already exists (see
+          // resolvedByChannel's doc comment, pipeline.ts) — using the FIRST
+          // channel's value here is safe for that common case, and still a
+          // reasonable starting point to edit even when it isn't (the user
+          // can "แยกตามช่องทาง" to see/fix each channel's own value).
+          const resolved = c.resolvedByChannel[c.channels[0]] ?? null;
+          const name = resolved?.customerName || c.customerName;
+          const distance = resolved?.distanceKm != null ? String(resolved.distanceKm) : "";
+          const tag = resolved?.tag ?? "";
+          const salesperson = resolved?.salesperson ?? "";
           return {
             customerCode: c.customerCode,
             customerName: name,
             truckLabels: c.truckLabels,
+            channel: "" as const,
             distanceKm: distance,
             tag,
             salesperson,
-            fromSheet: c.resolved !== null,
+            fromSheet: resolved !== null,
             originalCustomerName: name,
             originalDistanceKm: distance,
             originalTag: tag,
             originalSalesperson: salesperson,
+            allChannels: c.channels,
+            resolvedByChannel: c.resolvedByChannel,
+            truckLabelsByChannel: c.truckLabelsByChannel,
           };
         })
       );
@@ -247,6 +276,39 @@ export default function Home() {
       const next = [...prev];
       next[idx] = { ...next[idx], [field]: value } as ConfirmRow;
       return next;
+    });
+  }
+
+  /** Replaces one unsplit row (channel "") with one row PER channel the
+   *  customer actually appears in — each pre-filled with that channel's own
+   *  already-resolved value (which may just be the same general value if no
+   *  Sheet override exists yet for it), independently editable from here on.
+   *  See ConfirmRow.channel's doc comment for why this exists. */
+  function splitRowByChannel(idx: number) {
+    setRows((prev) => {
+      const row = prev[idx];
+      const splitRows: ConfirmRow[] = row.allChannels.map((channel) => {
+        const resolved = row.resolvedByChannel[channel] ?? null;
+        const name = resolved?.customerName || row.customerName;
+        const distance = resolved?.distanceKm != null ? String(resolved.distanceKm) : "";
+        const tag = resolved?.tag ?? "";
+        const salesperson = resolved?.salesperson ?? "";
+        return {
+          ...row,
+          channel,
+          customerName: name,
+          truckLabels: row.truckLabelsByChannel[channel] ?? row.truckLabels,
+          distanceKm: distance,
+          tag,
+          salesperson,
+          fromSheet: resolved !== null,
+          originalCustomerName: name,
+          originalDistanceKm: distance,
+          originalTag: tag,
+          originalSalesperson: salesperson,
+        };
+      });
+      return [...prev.slice(0, idx), ...splitRows, ...prev.slice(idx + 1)];
     });
   }
 
@@ -280,6 +342,7 @@ export default function Home() {
           rows.map((r) => ({
             customerCode: r.customerCode,
             customerName: r.customerName,
+            channel: r.channel,
             distanceKm: r.tag ? null : r.distanceKm.trim() ? Number(r.distanceKm) : null,
             tag: r.tag,
             salesperson: r.salesperson.trim(),
@@ -451,12 +514,25 @@ export default function Home() {
                 </thead>
                 <tbody>
                   {rows.map((r, idx) => (
-                    <tr key={r.customerCode} className={`border-t border-neutral-100 ${r.fromSheet ? "" : "bg-amber-50"}`}>
+                    <tr key={`${r.customerCode}::${r.channel || "all"}`} className={`border-t border-neutral-100 ${r.fromSheet ? "" : "bg-amber-50"}`}>
                       <td className="p-2 font-mono text-xs">{r.customerCode}</td>
                       <td className="p-2">
                         <input className="w-40 rounded border border-neutral-300 px-1 py-0.5 text-xs" value={r.customerName} onChange={(e) => updateRow(idx, "customerName", e.target.value)} />
                       </td>
-                      <td className="p-2 text-xs text-neutral-500">{r.truckLabels.join(", ")}</td>
+                      <td className="p-2 text-xs text-neutral-500">
+                        {r.truckLabels.join(", ")}
+                        {r.channel && <div className="mt-0.5 font-medium text-neutral-700">เฉพาะ {CHANNEL_LABEL_TH[r.channel]}</div>}
+                        {!r.channel && r.allChannels.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() => splitRowByChannel(idx)}
+                            className="mt-0.5 block text-left text-sky-700 underline decoration-dotted"
+                            title="ลูกค้ารายนี้ส่งด้วยหลายช่องทาง — แยกกรอกระยะทาง/Tag/เซลล์เป็นรายช่องทางได้ถ้าต่างกัน"
+                          >
+                            แยกตามช่องทาง ({r.allChannels.map((c) => CHANNEL_LABEL_TH[c]).join("/")})
+                          </button>
+                        )}
+                      </td>
                       <td className="p-2">
                         <input
                           className="w-20 rounded border border-neutral-300 px-1 py-0.5 text-xs"
