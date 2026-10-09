@@ -236,12 +236,19 @@ const BLOCK_SENTINEL = "ต้องตรวจสอบระยะทาง(M
  * out, and every downstream cell here is already wrapped in IFERROR(...,"")).
  */
 function freightFormula(r: number, scope: SheetScope): string {
+  // Both tags zero the freight rate — see this file's own standing note
+  // ("ลูกค้าที่มีแท็ก '1สาย1สู้' หรือ 'ทางผ่าน' ... ใช้ค่าขนส่ง/ลิตร = 0"). Checking
+  // only "1สาย1สู้" here left ทางผ่าน customers (blank distance) falling
+  // through to the distance-tier lookup, where INDEX/VLOOKUP on Master's
+  // blank distance cell returns 0 (not ""), missing the G="" guard too and
+  // landing on BLOCK_SENTINEL instead of the intended 0.
+  const zeroTagCheck = `OR(H${r}="1สาย1สู้",H${r}="ทางผ่าน")`;
   if (scope.fixedFreightRate !== null) {
-    return `IF(H${r}="1สาย1สู้",0,${scope.fixedFreightRate})`;
+    return `IF(${zeroTagCheck},0,${scope.fixedFreightRate})`;
   }
   const missingFallback = `"${BLOCK_SENTINEL}"`;
   return (
-    `IF(H${r}="1สาย1สู้",0,IF(G${r}="",${missingFallback},IFERROR(_xlfn.IFS(` +
+    `IF(${zeroTagCheck},0,IF(G${r}="",${missingFallback},IFERROR(_xlfn.IFS(` +
     `AND(G${r}>=20,G${r}<=59),0.15,AND(G${r}>=60,G${r}<=69),0.17,` +
     `AND(G${r}>=70,G${r}<=79),0.19,AND(G${r}>=80,G${r}<=89),0.2,` +
     `AND(G${r}>=90,G${r}<=99),0.22,AND(G${r}>=100,G${r}<=109),0.24,` +
