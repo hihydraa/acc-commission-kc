@@ -1,6 +1,7 @@
 import Decimal from "decimal.js";
 import { extractPdfText } from "./parser/pdfExtract";
 import { fixThaiText } from "./parser/thaiPuaFix";
+import { sanitizeXmlText } from "./parser/xmlSanitize";
 import { parseSalesReportText } from "./parser/salesReport";
 import { parseArReportText } from "./parser/arReport";
 import { calculateTransaction, type SaleType, type TransactionCalcResult } from "./calc/commissionEngine";
@@ -385,11 +386,11 @@ export async function runCommissionPipeline(
         exportRows.push({
           truckLabel,
           excelRow: excelRow++,
-          docNo: line.docNo,
+          docNo: sanitizeXmlText(line.docNo),
           baseDocNo: line.baseDocNo,
           docDate: line.date,
           customerCode: line.customerCode,
-          customerName: line.customerNameRaw,
+          customerName: sanitizeXmlText(line.customerNameRaw),
           productCode: line.productCode,
           qty: line.qty,
           saleValue: line.saleValue,
@@ -399,7 +400,7 @@ export async function runCommissionPipeline(
           freightForcedZero,
           masterTag: master?.tag ?? "",
           masterFound,
-          meterAnnotation: line.meterAnnotation,
+          meterAnnotation: line.meterAnnotation ? sanitizeXmlText(line.meterAnnotation) : line.meterAnnotation,
           salesperson,
           outstandingAmount: null,
           outstandingQty: null,
@@ -490,8 +491,8 @@ export async function runCommissionPipeline(
   const excludedCodes = new Set(excludedEntriesSeen.keys());
   const masterRows: MasterSheetRow[] = masterRowEntries.map(([customerCode, e, channel]) => ({
     customerCode,
-    customerName: excludedCodes.has(customerCode) ? e.customerName : customerNameByCode.get(customerCode) || e.customerName || customerCode,
-    salesperson: e.salesperson,
+    customerName: sanitizeXmlText(excludedCodes.has(customerCode) ? e.customerName : customerNameByCode.get(customerCode) || e.customerName || customerCode),
+    salesperson: sanitizeXmlText(e.salesperson),
     distanceKm: e.distanceKm,
     tag: e.tag,
     sourceText: e.sourceText,
