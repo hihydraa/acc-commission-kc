@@ -159,6 +159,21 @@ export async function previewQualifyingCustomers(
       const truckLabel = truckLabelForChannel(file.filename, group.channel);
       warnings.push(...parsed.warnings.map((w) => `[${truckLabel}] ${w}`));
 
+      // Same checksum cross-check as the final calculate step (below) — a
+      // report exported without its per-document detail section (just the
+      // per-customer/per-product totals) still parses its grandTotal line
+      // fine but yields ZERO individual lines, so this truck would silently
+      // show as having no qualifying customers at all on the confirm page
+      // with no indication why, unless this check runs here too.
+      if (parsed.grandTotal) {
+        const computedQty = parsed.lines.reduce((s, l) => s + l.qty, 0);
+        if (Math.abs(computedQty - parsed.grandTotal.qtyTotal) > 0.5) {
+          warnings.push(
+            `[${truckLabel}] checksum ปริมาณไม่ตรง: รวมจากรายการ ${computedQty.toLocaleString()} ลิตร แต่ไฟล์ระบุ ${parsed.grandTotal.qtyTotal.toLocaleString()} ลิตร — ไฟล์นี้อาจถูกส่งออกแบบไม่มีรายละเอียดเอกสาร (เลขที่เอกสาร/วันที่) ต่อรายการ ตรวจสอบการตั้งค่าตอน export รายงานขาย`
+          );
+        }
+      }
+
       for (const line of parsed.lines) {
         if (line.customerCode === "-") continue;
         const isExcluded = branch.excludedCustomers.some((e) => e.customerCode === line.customerCode);
