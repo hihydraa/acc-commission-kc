@@ -18,7 +18,21 @@
  */
 import pdfParse from "pdf-parse";
 
-export async function extractPdfText(buffer: Buffer): Promise<string> {
+export async function extractPdfText(buffer: Buffer, filename?: string): Promise<string> {
+  const label = filename ? `[${filename}] ` : "";
+  if (buffer.length === 0) {
+    // Both pdf-parse and pdfjs-dist report this identically unhelpfully
+    // ("stream must have data" / "the PDF file is empty") — check it
+    // directly so the message actually says what's wrong: the BROWSER sent
+    // 0 bytes for this file, which isn't something this server can read
+    // around. The most common real-world cause is a cloud-synced folder
+    // (OneDrive/Google Drive "files on demand") where the file shows up in
+    // Explorer but isn't actually downloaded to disk yet — the browser's
+    // file picker then reads an empty placeholder instead of the real PDF.
+    throw new Error(
+      `${label}ไฟล์มีขนาด 0 ไบต์ (ไฟล์ว่างเปล่า) — เบราว์เซอร์ส่งไฟล์นี้มาแบบไม่มีเนื้อหาเลย มักเกิดจากไฟล์อยู่ในโฟลเดอร์ที่ซิงก์กับ OneDrive/Google Drive แบบ "ไฟล์ตามต้องการ" ที่ยังไม่ได้ดาวน์โหลดลงเครื่องจริง — ลองเปิดไฟล์นี้ด้วยโปรแกรมอ่าน PDF ก่อนเพื่อบังคับให้ดาวน์โหลดเต็ม แล้วอัปโหลดใหม่อีกครั้ง`
+    );
+  }
   try {
     const result = await pdfParse(buffer);
     return result.text;
@@ -28,7 +42,7 @@ export async function extractPdfText(buffer: Buffer): Promise<string> {
     } catch (fallbackErr) {
       const primaryMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
       const fallbackMsg = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
-      throw new Error(`อ่าน PDF ไม่สำเร็จทั้ง 2 วิธี — pdf-parse: ${primaryMsg} | pdfjs-dist: ${fallbackMsg}`);
+      throw new Error(`${label}อ่าน PDF ไม่สำเร็จทั้ง 2 วิธี — pdf-parse: ${primaryMsg} | pdfjs-dist: ${fallbackMsg}`);
     }
   }
 }

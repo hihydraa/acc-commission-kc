@@ -153,7 +153,7 @@ export async function previewQualifyingCustomers(
   for (const group of channelInputs) {
     const rule = CHANNEL_RULE[group.channel];
     for (const file of group.files) {
-      const rawText = await extractPdfText(file.buffer);
+      const rawText = await extractPdfText(file.buffer, file.filename);
       const { fixed: text } = fixThaiText(rawText);
       const parsed = parseSalesReportText(text);
       const truckLabel = truckLabelForChannel(file.filename, group.channel);
@@ -210,7 +210,7 @@ export async function runCommissionPipeline(
   const warnings: string[] = [];
 
   // ---------- parse AR (outstanding debt) ----------
-  const arText = await extractPdfText(arFile.buffer);
+  const arText = await extractPdfText(arFile.buffer, arFile.filename);
   const parsedAr = parseArReportText(arText);
   warnings.push(...parsedAr.warnings.map((w) => `[AR] ${w}`));
   const arByBaseDoc = new Map<string, typeof parsedAr.rows>();
@@ -248,7 +248,7 @@ export async function runCommissionPipeline(
   for (const group of channelInputs) {
     const rule = CHANNEL_RULE[group.channel];
     for (const file of group.files) {
-      const rawText = await extractPdfText(file.buffer);
+      const rawText = await extractPdfText(file.buffer, file.filename);
       const { fixed: text, unresolved } = fixThaiText(rawText);
       if (unresolved.size > 0) {
         warnings.push(
