@@ -42,6 +42,18 @@ export interface BranchConfig {
    *  hardcoded, so this can change without a redeploy. */
   pumpFillSalesperson: string | null;
 
+  /** null/empty = every "กรอกหลังปั๊ม" transaction counts as usual (the
+   *  common case). A non-empty list of customer codes restricts the
+   *  "กรอกหลังปั๊ม" channel to ONLY those codes — every other customer code
+   *  seen on that channel is treated exactly like excludedCustomers (zero
+   *  commission, "ตัดออก" in the sheet). Built for กระนวน: its pump-fill
+   *  sales export is recorded together with the regular station's own
+   *  sales, so the file contains far more customers than are actually
+   *  pump-fill customers — an allowlist of the genuine few is far more
+   *  maintainable than excluding everyone else by name. Editable at
+   *  /settings (src/lib/settings.ts's BranchOverride), not hardcoded. */
+  pumpFillAllowlist: string[] | null;
+
   /** customers excluded from marketing commission entirely for this branch
    *  (e.g. a รถมิเตอร์-driver's own customer, a payment-method code
    *  mistakenly appearing as a customer) — applies across every channel;

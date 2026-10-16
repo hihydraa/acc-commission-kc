@@ -26,6 +26,7 @@ export const samthongBranch: BranchConfig = {
   // สามทองมีช่องกรอกหลังปั๊มเหมือนกระนวน แต่ไม่เคยมีไฟล์จริงมาตรวจสอบว่าเซลล์
   // ประจำคือใคร (14 ก.ย.69) — เว้นว่างไว้จนกว่าจะยืนยัน ตั้งค่าได้ที่ /settings
   pumpFillSalesperson: null,
+  pumpFillAllowlist: null,
 
   excludedCustomers: [
     { customerCode: "ST57039", customerName: "ATA ปิโตรเลียม", reason: "เป็นลูกค้าของพนักงานขับรถมิเตอร์ ไม่ใช่ลูกค้าของเซลล์การตลาด" },

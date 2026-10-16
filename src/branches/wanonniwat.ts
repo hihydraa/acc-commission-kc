@@ -29,6 +29,7 @@ export const wanonniwatBranch: BranchConfig = {
   // set this to a single fixed name for this branch, it must keep resolving
   // per customer via the Google Sheet / confirmation page like other channels.
   pumpFillSalesperson: null,
+  pumpFillAllowlist: null,
 
   excludedCustomers: [],
 

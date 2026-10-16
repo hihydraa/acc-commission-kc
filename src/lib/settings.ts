@@ -18,6 +18,11 @@ import type { BranchConfig, ExcludedCustomer } from "@/branches/types";
 export interface BranchOverride {
   excludedCustomers: ExcludedCustomer[];
   pumpFillSalesperson: string | null;
+  /** see BranchConfig.pumpFillAllowlist (branches/types.ts) — undefined (a
+   *  pre-existing override blob saved before this setting existed) falls
+   *  back to the branch's hardcoded default, same convention as every other
+   *  field here. */
+  pumpFillAllowlist?: string[] | null;
   updatedAt: string;
   updatedBy?: string;
 }
@@ -72,6 +77,7 @@ export function applyBranchOverride(branch: BranchConfig, override: BranchOverri
     // default — only an entirely absent field (a pre-existing override blob
     // saved before this setting existed) falls back to the hardcoded value.
     pumpFillSalesperson: override.pumpFillSalesperson !== undefined ? override.pumpFillSalesperson : branch.pumpFillSalesperson,
+    pumpFillAllowlist: override.pumpFillAllowlist !== undefined ? override.pumpFillAllowlist : branch.pumpFillAllowlist,
   };
 }
 
@@ -82,6 +88,7 @@ export function effectiveEditableState(branch: BranchConfig, override: BranchOve
   return {
     excludedCustomers: override?.excludedCustomers ?? branch.excludedCustomers,
     pumpFillSalesperson: override?.pumpFillSalesperson !== undefined ? override.pumpFillSalesperson : branch.pumpFillSalesperson,
+    pumpFillAllowlist: override?.pumpFillAllowlist !== undefined ? override.pumpFillAllowlist : branch.pumpFillAllowlist,
     updatedAt: override?.updatedAt ?? null,
     updatedBy: override?.updatedBy ?? null,
   };

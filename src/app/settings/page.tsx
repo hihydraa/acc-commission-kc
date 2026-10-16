@@ -14,8 +14,16 @@ interface SettingsResponse {
   branch: { id: string; label: string; companyName: string };
   excludedCustomers: ExcludedCustomer[];
   pumpFillSalesperson: string | null;
+  pumpFillAllowlist: string[] | null;
   updatedAt: string | null;
   updatedBy: string | null;
+}
+
+/** Textarea -> code list: one code per line (also accepts comma/space
+ *  separation, since this will likely get pasted in from elsewhere), blank
+ *  lines ignored. */
+function parseAllowlistText(text: string): string[] {
+  return [...new Set(text.split(/[\n,]/).map((s) => s.trim().toUpperCase()).filter(Boolean))];
 }
 
 function validateExcludedCustomers(rows: ExcludedCustomer[]): string | null {
@@ -33,6 +41,7 @@ export default function SettingsPage() {
   const [error, setError] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [updatedBy, setUpdatedBy] = useState("");
+  const [allowlistText, setAllowlistText] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -49,6 +58,7 @@ export default function SettingsPage() {
           setData(null);
         } else {
           setData(json as SettingsResponse);
+          setAllowlistText(((json as SettingsResponse).pumpFillAllowlist ?? []).join("\n"));
         }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -94,6 +104,7 @@ export default function SettingsPage() {
           branchId,
           excludedCustomers: data.excludedCustomers,
           pumpFillSalesperson: data.pumpFillSalesperson,
+          pumpFillAllowlist: parseAllowlistText(allowlistText),
           updatedBy: updatedBy || undefined,
         }),
       });
@@ -153,6 +164,23 @@ export default function SettingsPage() {
                 value={data.pumpFillSalesperson ?? ""}
                 onChange={(e) => setData({ ...data, pumpFillSalesperson: e.target.value || null })}
               />
+            </div>
+
+            <div className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">
+              <h2 className="font-semibold">รายชื่อลูกค้ากรอกหลังปั๊มจริง (allowlist)</h2>
+              <p className="mt-1 text-xs text-neutral-500">
+                สำหรับสาขาที่ไฟล์กรอกหลังปั๊มบันทึกรวมกับยอดขายหน้าสถานี (เช่น กระนวน) — ถ้ากรอกรหัสลูกค้าไว้ที่นี่
+                ช่องทางกรอกหลังปั๊มจะนับ<strong>เฉพาะ</strong>รหัสที่อยู่ในรายการนี้เท่านั้น ลูกค้ารายอื่นในไฟล์จะถูกตัดออกจากค่าคอมโดยอัตโนมัติ
+                (เหมือนลูกค้ายกเว้น) — เว้นว่างไว้ทั้งหมด = ไม่กรอง นับทุกคนในไฟล์ตามปกติ (ค่าเริ่มต้นของทุกสาขา)
+              </p>
+              <textarea
+                placeholder={"หนึ่งรหัสต่อบรรทัด เช่น\nKNDC1234\nKNDC5678"}
+                rows={5}
+                className="mt-2 w-full rounded border border-neutral-300 px-3 py-2 font-mono text-sm"
+                value={allowlistText}
+                onChange={(e) => setAllowlistText(e.target.value)}
+              />
+              <p className="mt-1 text-xs text-neutral-500">{parseAllowlistText(allowlistText).length} รหัสในรายการ</p>
             </div>
 
             <div className="rounded-lg border border-neutral-200 bg-white p-6 shadow-sm">

@@ -25,6 +25,21 @@ function sanitizeExcludedCustomers(v: ExcludedCustomer[]): ExcludedCustomer[] {
   return v.map((c) => ({ customerCode: c.customerCode.trim().toUpperCase(), customerName: c.customerName.trim(), reason: c.reason.trim() }));
 }
 
+function isValidPumpFillAllowlist(v: unknown): v is string[] | null {
+  if (v === null) return true;
+  if (!Array.isArray(v)) return false;
+  return v.every((code) => typeof code === "string" && code.trim());
+}
+
+function sanitizePumpFillAllowlist(v: string[] | null): string[] | null {
+  if (v === null) return null;
+  const codes = [...new Set(v.map((code) => code.trim().toUpperCase()))];
+  // An empty list means the same thing as null (no restriction) — never let
+  // a blank/cleared-out list silently zero out the whole channel's
+  // commission for every customer.
+  return codes.length > 0 ? codes : null;
+}
+
 export async function GET(request: NextRequest) {
   const branchId = request.nextUrl.searchParams.get("branchId");
   const settings = await loadSettings();
@@ -50,7 +65,7 @@ export async function POST(request: NextRequest) {
   } catch {
     return NextResponse.json({ error: "ข้อมูลที่ส่งมาไม่ใช่ JSON ที่ถูกต้อง" }, { status: 400 });
   }
-  const { branchId, excludedCustomers, pumpFillSalesperson, updatedBy } = (body ?? {}) as Record<string, unknown>;
+  const { branchId, excludedCustomers, pumpFillSalesperson, pumpFillAllowlist, updatedBy } = (body ?? {}) as Record<string, unknown>;
 
   if (typeof branchId !== "string") {
     return NextResponse.json({ error: "ไม่ได้ระบุสาขา (branchId)" }, { status: 400 });
@@ -65,10 +80,14 @@ export async function POST(request: NextRequest) {
   if (pumpFillSalesperson !== null && typeof pumpFillSalesperson !== "string") {
     return NextResponse.json({ error: "เซลล์ประจำกรอกหลังปั๊มไม่ถูกต้อง" }, { status: 400 });
   }
+  if (!isValidPumpFillAllowlist(pumpFillAllowlist)) {
+    return NextResponse.json({ error: "รายชื่อลูกค้ากรอกหลังปั๊มไม่ถูกต้อง" }, { status: 400 });
+  }
 
   const override: BranchOverride = {
     excludedCustomers: sanitizeExcludedCustomers(excludedCustomers),
     pumpFillSalesperson: typeof pumpFillSalesperson === "string" && pumpFillSalesperson.trim() ? pumpFillSalesperson.trim() : null,
+    pumpFillAllowlist: sanitizePumpFillAllowlist(pumpFillAllowlist),
     updatedAt: new Date().toISOString(),
     updatedBy: typeof updatedBy === "string" && updatedBy.trim() ? updatedBy.trim() : undefined,
   };

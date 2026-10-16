@@ -177,7 +177,14 @@ export async function previewQualifyingCustomers(
       for (const line of parsed.lines) {
         if (line.customerCode === "-") continue;
         const isExcluded = branch.excludedCustomers.some((e) => e.customerCode === line.customerCode);
-        if (isExcluded) continue;
+        // A non-empty pumpFillAllowlist restricts the กรอกหลังปั๊ม channel to
+        // ONLY those customer codes — built for branches (กระนวน) whose
+        // pump-fill export is recorded together with the station's own
+        // regular sales, so most codes in that file aren't actually
+        // pump-fill customers at all (see BranchConfig.pumpFillAllowlist).
+        const isPumpFillNotAllowed =
+          group.channel === "pumpFill" && !!branch.pumpFillAllowlist && branch.pumpFillAllowlist.length > 0 && !branch.pumpFillAllowlist.includes(line.customerCode);
+        if (isExcluded || isPumpFillNotAllowed) continue;
         const qualifiesByProduct = fuelSet.has(line.productCode);
         const qualifiesByQty = line.qty >= rule.minQtyLiters && (!rule.requireExactMultiple || line.qty % rule.qtyMultipleOf === 0);
         if (!qualifiesByProduct || !qualifiesByQty) continue;
@@ -353,7 +360,20 @@ export async function runCommissionPipeline(
           if (master) masterByCode.set(masterCacheKey, master);
         }
 
-        const exclusion = branch.excludedCustomers.find((e) => e.customerCode === line.customerCode) ?? null;
+        // Same allowlist gate as previewQualifyingCustomers (see its own
+        // comment) — reuses the exclusion machinery below wholesale instead
+        // of duplicating the zero-commission/"ตัดออก" handling a second time.
+        const pumpFillNotAllowed =
+          group.channel === "pumpFill" && !!branch.pumpFillAllowlist && branch.pumpFillAllowlist.length > 0 && !branch.pumpFillAllowlist.includes(line.customerCode);
+        const exclusion =
+          branch.excludedCustomers.find((e) => e.customerCode === line.customerCode) ??
+          (pumpFillNotAllowed
+            ? {
+                customerCode: line.customerCode,
+                customerName: customerNameByCode.get(line.customerCode) || line.customerNameRaw || line.customerCode,
+                reason: "ไม่ใช่ลูกค้ากรอกหลังปั๊มจริง (ปนมาจากยอดขายหน้าสถานีในไฟล์เดียวกัน) — ไม่อยู่ใน allowlist ที่หน้า /settings",
+              }
+            : null);
         if (exclusion && !excludedEntriesSeen.has(line.customerCode)) {
           excludedEntriesSeen.set(line.customerCode, {
             customerName: `${exclusion.customerName} (ตัดออก)`,

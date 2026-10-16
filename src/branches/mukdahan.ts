@@ -28,6 +28,7 @@ export const mukdahanBranch: BranchConfig = {
   // Not yet confirmed whether this branch even has a กรอกหลังปั๊ม channel or
   // who runs it — set at /settings once confirmed.
   pumpFillSalesperson: null,
+  pumpFillAllowlist: null,
 
   excludedCustomers: [],
 
